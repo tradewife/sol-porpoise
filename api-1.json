@@ -1,0 +1,4556 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Imperial Trading API",
+    "description": "\nImperial is a perpetual futures router on Solana — a single passthrough program that brokers\ntrades across multiple underlying perp venues (Jupiter, Flash Trade, Phoenix, GMTrade, …).\nThis HTTP API is the surface third-party bots and integrators use to authenticate, submit\norders, and read public on-chain state.\n\n## Authentication\n\nTrading endpoints are JWT-gated. The flow:\n\n1. `POST /mobile/connect` — sign `imperial:mobile-connect:{wallet}:{nonce}` with your Solana\n   keypair and post `{wallet, message, signature}`. Response: a one-time `code`.\n2. `POST /mobile/exchange` — exchange the `code` for `{jwt, expires_at}`. The code expires in\n   5 minutes and can only be redeemed once.\n3. Send trading requests with `Authorization: Bearer <jwt>`. The JWT's wallet claim must match\n   the `wallet` field in every request body.\n4. `POST /mobile/revoke` — revoke the JWT when you're done (e.g. bot shutdown, key rotation).\n\nThe JWT is a Solana-signature-anchored delegation: holding it is equivalent to letting the\noperator place orders from the associated wallet's profiles. Treat it like an API key — copy\nit once, store it securely, and revoke it if compromised.\n\nMulti-wallet bots (e.g. fan-out traders): each wallet owner independently completes the flow\non their own dashboard and shares their JWT with the bot operator. The bot then holds N tokens\nand calls the API in parallel, one request per wallet. Any wallet owner can revoke their token\nanytime without affecting the others.\n\n## Rate limits\n\nUnified limit: **600 requests/minute sustained, burst of 120**. Keyed per-wallet when a valid\nJWT is present, else per-IP. Exceeding the budget returns `429 Too Many Requests` with a\n`Retry-After` header and `{ \"error\": \"rate_limited\", \"retry_after_seconds\": N }` body. The\n`/health`, `/ws`, and Telegram webhook endpoints are not rate limited.\n\n## WebSockets\n\nTwo endpoints. Both are unauthenticated and exempt from the rate limiter.\n\n### `GET /ws` — wallet-scoped invalidation signals\n\nSubscribe by wallet to learn when your own positions or orders change. Server messages are\ncoalesced refetch triggers; the API does not push full state here.\n\n```json\n{ \"type\": \"subscribe\", \"wallet\": \"<base58-pubkey>\" }\n```\n\n- `{ \"type\": \"positions_updated\" }` — fired on position open, close, DCA leg execution, and\n  fill completion. Refetch `/positions`.\n- `{ \"type\": \"orders_updated\" }` — fired on order creation, execution, and cancellation.\n  Refetch `/orders` for the unified view, or `/passthrough/users/{wallet}/orders` for the\n  passthrough subset only.\n\nPing/pong keepalive: send `{ \"type\": \"ping\" }`, receive `{ \"type\": \"pong\" }`. Reconnect with\nbackoff on drops — there is no replay buffer, so refetch on reconnect to resync.\n\n### `GET /ws/market` — public market-data stream\n\nReplaces polling on `/funding-rates`, `/mark-prices`, and `/phoenix/depth`. Each push carries\nthe full payload, so clients never have to refetch. On every successful `subscribe_*` the\nserver immediately pushes the current cached snapshot before tracking diffs — late\nsubscribers don't have to wait a publisher tick.\n\nSubscribe / unsubscribe messages:\n\n```json\n{ \"type\": \"subscribe_funding_rates\" }\n{ \"type\": \"subscribe_mark_prices\" }\n{ \"type\": \"subscribe_phoenix_depth\" }                      // all symbols\n{ \"type\": \"subscribe_phoenix_depth\", \"symbols\": [\"SOL\"] }  // filtered\n{ \"type\": \"unsubscribe_funding_rates\" }\n{ \"type\": \"unsubscribe_mark_prices\" }\n{ \"type\": \"unsubscribe_phoenix_depth\" }\n{ \"type\": \"ping\" }\n```\n\nServer-pushed events:\n\n- `{ \"type\": \"funding_rate_update\", \"symbol\": \"SOL\", \"venue\": \"phoenix\" | \"jupiter\" |\n  \"flash\" | \"gmtrade\", \"source\": <RateSource>, \"longFundingRatePerHourPercent\": <f64|null>,\n  \"shortFundingRatePerHourPercent\": <f64|null>, \"longBorrowRatePerHourPercent\": <f64|null>,\n  \"shortBorrowRatePerHourPercent\": <f64|null> }` — same shape as a per-venue entry on\n  `/funding-rates`. The `source` discriminator carries provenance (live vs. fallback);\n  filter on it the same way you would in the REST response.\n- `{ \"type\": \"mark_price_update\", \"symbol\": \"SOL\", \"venue\": \"phoenix\" | \"flash\",\n  \"source\": <PriceSource>, \"price\": <f64>, \"fetchedAtUnixMs\": <i64> }`.\n- `{ \"type\": \"phoenix_depth_update\", \"symbol\": \"SOL\", \"snapshot\": <DepthSnapshot> }` —\n  the `symbol` here is the **Phoenix-raw** symbol (`GOLD` rather than `XAU`), matching\n  what `/phoenix/depth` returns.\n\nFunding sign convention: `longFundingRatePerHourPercent > 0` means longs pay shorts.\nPhoenix's short rate is the negation of its long rate (single-pool perp); GMTrade reports\nboth sides independently. Funding fields are `null` for venues that only expose borrow\nrates (Jupiter, Flash) — populated borrow fields are non-negative regardless of side.\n\nSymbols are canonical (`SOL`, `BTC`, `XAU`) on `funding_rate_update` and `mark_price_update`;\n`phoenix_depth_update` uses Phoenix-raw symbols (`SOL`, `GOLD`, …). Translate accordingly.\n\n## Order types\n\nThe `orderType` field on `/mobile/orders` takes a numeric code:\n\n| Code | Name             | Notes                                                   |\n|-----:|------------------|---------------------------------------------------------|\n|    0 | Market           | `triggerPrice` ignored                                  |\n|    1 | Limit            | Requires `triggerPrice`                                 |\n|    2 | StopLimit        | Requires `triggerPrice`                                 |\n|    3 | LandMine         | Requires `triggerPrice`, `extraData.waitPrice`, `waitDuration` |\n|    4 | Ratchet          | Requires `extraData.worstPrice`, `ratchetSize`          |\n|    6 | RatchetEntry     | Same extras as Ratchet                                  |\n|    9 | Dca              | Requires `extraData.dcaStartPrice`, `dcaEndPrice`, `dcaNumLegs` |\n|   10 | FibRatchet       | Same extras as Ratchet                                  |\n|   11 | FibRatchetEntry  | Same extras as Ratchet                                  |\n|   12 | DcaClose         | Requires `extraData.dcaCloseStartPrice`, `dcaCloseEndPrice`, `dcaCloseNumLegs` |\n|   13 | DcaTimeClose     | Requires `extraData.dcaCloseIntervalSeconds`, `dcaCloseNumLegs` |\n|   14 | DcaRatchetClose  | Requires `extraData.dcaCloseNumLegs`, `dcaCloseRatchetSize` |\n|   15 | DcaTime          | Requires `extraData.dcaIntervalSeconds`, `dcaNumLegs`   |\n|   16 | DcaRatchet       | Requires `extraData.dcaNumLegs`, `dcaRatchetSize`       |\n\n`underwriter`: 0 = Jupiter, 1 = Flash Trade, 2 = Phoenix, 3 = GMTrade. (4 is reserved for\nPacifica and rejected today.) Wire format mirrors `passthrough_client::Underwriter`.\n`side`: 0 = long, 1 = short.\n`action`: 0 = Increase, 1 = Decrease.\n\n## Subaccounts (profiles)\n\nEvery wallet has six implicit subaccounts indexed `0..5`. Each subaccount is its own\nisolated-margin profile; balances and positions don't mix across them. There is no\n\"create subaccount\" call — the on-chain profile PDA is created lazily by the order-bot\non the first `/deposit/build-tx` or first `/mobile/orders` placement that targets that\n`profileIndex`. `/mobile/balances` will return `usdc: 0` for every uninitialized profile\nwithout erroring; that's a normal \"this index has never been used\" response, not a\nprovisioning gate.\n\n`profileIndex` is required on every order, deposit, and balance call. Pick a convention\n(e.g. profile 0 for default, 1+ for strategy buckets) and stick with it — there's no\nserver-side notion of a \"primary\" profile.\n\n## Trading bot quickstart\n\nEnd-to-end flow for a bot that opens a position on one venue and hedges it on another.\n\n1. **Auth** — `POST /mobile/connect` then `POST /mobile/exchange` to get a JWT (see\n   \"Authentication\" above). All subsequent trading calls send `Authorization: Bearer <jwt>`.\n2. **Fund the profile** — `POST /deposit/build-tx` with `mode: \"deposit\"` returns a sponsored,\n   partially-signed transaction that creates the profile (if new) and deposits USDC from the\n   wallet's USDC ATA. Sign with the wallet's keypair and submit. Same endpoint with\n   `mode: \"withdraw\"` pulls USDC back to the wallet. Skip if the profile is already funded\n   for the size you want to trade.\n3. **Pick a venue pair** — `GET /funding-rates` returns one row per canonical symbol with\n   per-venue funding/borrow rates. Decide which venue to long and which to short. For a\n   single-venue trade, `GET /route?asset=...&side=...&notional=...` returns a cost-optimized\n   recommendation.\n4. **Check available USDC** — `GET /mobile/balances` returns the per-subaccount USDC balance\n   in 6-decimal native units. Size each leg against this; an underfunded profile fails the\n   margin check on submission.\n5. **Open the legs** — `POST /mobile/orders` with `action=0` (Increase). Use `symbol` (e.g.\n   `\"SOL\"`, `\"XAU\"`) plus `underwriter` to address the market — the same canonical symbol\n   you read from `/funding-rates`. The server resolves it to the right `marketMint` per\n   venue, including Phoenix synthetics that have no SPL mint of their own. Existing\n   integrations can still send `marketMint` directly. Fire the legs sequentially: if the\n   second leg fails, immediately submit a Decrease for the first to unwind. The endpoint\n   returns HTTP 200 even on rejection — always inspect `success` and `error` (see\n   \"Trading-endpoint response convention\" below). Successful resting orders return\n   `orderPda`, which you can pass straight to `/mobile/orders/cancel` or `/update` without\n   waiting for indexer catch-up. Phoenix orders auto-activate the trader account on first\n   use; you don't need to call `/phoenix/register` first. Per-venue market lists are still\n   available at `/phoenix/markets`, `/flash/markets`, `/gmtrade/markets` if you need\n   underlying details (orderbook PDAs, leverage tiers, fee tables).\n6. **Track state** — subscribe to both WS endpoints. `/ws/market` pushes funding-rate / mark-\n   price / depth updates so you don't have to poll. `/ws` (with `subscribe` keyed on your\n   wallet) pings you when your positions or orders change; refetch `/positions` and `/orders`\n   on each ping. There is no replay buffer on either socket — refetch on reconnect.\n7. **Close the legs** — `POST /mobile/orders` with `action=1` (Decrease) on each leg. Use\n   `sizeUsd` equal to the open size for a full close.\n8. **Reclaim residue** — after closing a position whose collateral was non-USDC (long\n   SOL/BTC/ETH custody on Jupiter or Flash leaves WSOL/WBTC/WETH on the profile), call\n   `POST /passthrough/users/{wallet}/profiles/{index}/sync` to swap residue back to USDC\n   and route to the user wallet. Idempotent. Pure-USDC venues (Phoenix shorts, USDC-margin\n   profiles) don't need this step.\n\n## Trading-endpoint response convention\n\n`POST /mobile/orders[/batch|/cancel|/collateral|/update]` always returns HTTP 200 once the\nrequest was well-formed and the order bot was reachable, even if the order was rejected\non-chain. Inspect the response body:\n\n- `success: true` — order accepted, `signature` is the Solana tx signature.\n- `success: false` — order rejected; `error` is a human-readable message and the raw bot\n  error is logged server-side. Common cases: leverage too high, market closed, slippage\n  exceeded, no matching open position for a close-side order.\n\nHTTP 4xx is reserved for malformed input or auth failures (missing/invalid JWT, mismatched\nwallet claim). HTTP 5xx is reserved for the server itself failing (database or order-bot\ntransport failures that aren't fully recoverable).\n",
+    "contact": {
+      "name": "Imperial",
+      "url": "https://imperial.trade"
+    },
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.imperial.space",
+      "description": "Production"
+    },
+    {
+      "url": "http://localhost:8080",
+      "description": "Local"
+    }
+  ],
+  "paths": {
+    "/api/v1/deposit/build-tx": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "operationId": "deposit_build_tx",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildDepositTxRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "A partially-signed sponsored transaction. For `mode: \"deposit\"`, it creates the user-account PDA (if needed) and the profile's USDC ATA, then transfers USDC from the wallet's USDC ATA into the profile. For `mode: \"withdraw\"`, it creates the wallet's USDC ATA (if needed) and withdraws USDC from the profile back to the wallet. The operator signs for rent and ATA creation; the caller must sign with the wallet keypair before submission.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildDepositTxResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Order bot unreachable or build failed"
+          }
+        }
+      }
+    },
+    "/api/v1/flash/markets": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_flash_markets",
+        "responses": {
+          "200": {
+            "description": "Flash Trade markets, one row per (symbol, side). `maxLeverage`, `openPositionFeeRate`, and `volatilityFeeRate` are populated when Flash's API is reachable; falls back to a hardcoded list otherwise.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FlashMarketResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/funding-rates": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_funding_rates_summary",
+        "responses": {
+          "200": {
+            "description": "Unified funding & borrow rates keyed by canonical symbol. Each row has up to four per-venue entries (jupiter, flash, phoenix, gmtrade) — present only when that venue lists the symbol. The `source` field on each entry marks provenance (live vs. fallback). GMTrade exposes per-side funding directly; Phoenix funding comes from the venue's `market` WS channel (`phoenix_market_ws` source; rows still warming report `phoenix_clob_no_snapshot` with null rates); Jupiter and Flash use borrow rates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnifiedFundingRatesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/gmtrade/funding-rates": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_gmtrade_funding_rates",
+        "responses": {
+          "200": {
+            "description": "Per-symbol GMTrade funding/borrow/net rates (percent per hour). Empty until the WS feed has populated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GmTradeFundingRatesResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/gmtrade/liquidity": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_gmtrade_liquidity",
+        "responses": {
+          "200": {
+            "description": "Per-symbol open-interest headroom (USD) per side. Refreshed every 30s from the on-chain Market account.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GmTradeLiquidityResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/gmtrade/markets": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_gmtrade_markets",
+        "responses": {
+          "200": {
+            "description": "GMTrade markets. A symbol may have multiple variants (per collateral pair); the `closed` flag reflects the on-chain `Market.flags.Closed` bit and is authoritative — the program rejects orders against a closed market with `MarketClosed (6127)`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GmTradeMarketResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/mark-prices": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_mark_prices_summary",
+        "responses": {
+          "200": {
+            "description": "Unified mark prices keyed by canonical symbol, with one entry per venue listing the symbol. Phoenix mid (live orderbook WS), Flash CustomOracle (Pyth-pushed), Jupiter Doves AgPriceFeed (read directly via RPC every 1s), and GMTrade indexMin/indexMax mid (from its `indexTokens` WS, refreshed every 5min). The `source` field on each entry marks provenance; `fetchedAtUnixMs` lets you gate on freshness.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnifiedMarkPricesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/mobile/balances": {
+      "get": {
+        "tags": [
+          "trading"
+        ],
+        "operationId": "mobile_balances",
+        "responses": {
+          "200": {
+            "description": "Per-subaccount USDC balances. Each entry is one Imperial profile (`profile_index` 0..5). USDC is held in the profile's USDC ATA in 6-decimal native units. Use this to size new orders before calling `/mobile/orders`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileBalancesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, or revoked JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer_jwt": []
+          }
+        ]
+      }
+    },
+    "/api/v1/mobile/connect": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "mobile_connect",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileConnectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One-time code to exchange for a JWT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileConnectResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid message format or replayed nonce"
+          },
+          "401": {
+            "description": "Signature verification failed"
+          }
+        }
+      }
+    },
+    "/api/v1/mobile/exchange": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "mobile_exchange",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileExchangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "JWT and expiry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileExchangeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or expired connect code"
+          }
+        }
+      }
+    },
+    "/api/v1/mobile/orders": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "operationId": "mobile_create_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileCreateOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Order outcome. `success=false` with an `error` message is a rejected-but-valid response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileOrderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error (e.g. missing `extraData` for ratchet/DCA order types)"
+          },
+          "401": {
+            "description": "Missing, invalid, or revoked JWT, or JWT wallet doesn't match `wallet`"
+          }
+        },
+        "security": [
+          {
+            "bearer_jwt": []
+          }
+        ]
+      }
+    },
+    "/api/v1/mobile/orders/batch": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "summary": "Submit an entry order and its attached close legs (TP/SL/ratchet/etc.)\nin one request.",
+        "description": "The entry and close legs travel together so close-target validation is\nimplicit: a close leg whose tuple matches its entry is, by construction,\ntargeting the position that entry will create. This avoids the racy\n\"is the entry order indexed yet?\" lookup the per-order endpoint would\notherwise need when the mobile client fires entry + closes in quick\nsuccession.\n\nSubmission is sequential: entry first, then each close in input order. If\nthe entry fails, no close legs are submitted (no position to attach to).\nClose failures don't roll back the entry — same partial-state semantics as\nthe homepage flow today.",
+        "operationId": "mobile_create_order_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileCreateOrderBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Batch submitted (inspect per-leg `success` flags)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileCreateOrderBatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error on the bundle"
+          },
+          "401": {
+            "description": "JWT missing, expired, or wallet mismatch"
+          }
+        },
+        "security": [
+          {
+            "bearer_jwt": []
+          }
+        ]
+      }
+    },
+    "/api/v1/mobile/orders/cancel": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "operationId": "mobile_cancel_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileCancelOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Cancel outcome. `success=false` with an `error` message means the order bot rejected the request (e.g. order already executed, on-chain cancel ineligible).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileOrderResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, or revoked JWT, or JWT wallet doesn't match `wallet`"
+          }
+        },
+        "security": [
+          {
+            "bearer_jwt": []
+          }
+        ]
+      }
+    },
+    "/api/v1/mobile/orders/collateral": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "operationId": "mobile_collateral_edit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileCollateralEditRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Collateral-edit outcome. `success=false` with an `error` message means the order bot rejected the edit (e.g. removing more collateral than available, leverage out of bounds).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileOrderResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, or revoked JWT, or JWT wallet doesn't match `wallet`"
+          }
+        },
+        "security": [
+          {
+            "bearer_jwt": []
+          }
+        ]
+      }
+    },
+    "/api/v1/mobile/orders/update": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "operationId": "mobile_update_order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MobileUpdateOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Update outcome. `success=false` with an `error` message means the order bot rejected the update (e.g. order already filled or cancelled, native limit-order updates not supported).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MobileOrderResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, or revoked JWT, or JWT wallet doesn't match `wallet`"
+          }
+        },
+        "security": [
+          {
+            "bearer_jwt": []
+          }
+        ]
+      }
+    },
+    "/api/v1/mobile/revoke": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "mobile_revoke",
+        "responses": {
+          "200": {
+            "description": "JWT was added to the revocation list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Bearer token"
+          }
+        },
+        "security": [
+          {
+            "bearer_jwt": []
+          }
+        ]
+      }
+    },
+    "/api/v1/orders": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_combined_orders",
+        "parameters": [
+          {
+            "name": "walletAddress",
+            "in": "query",
+            "description": "Base58 Solana wallet pubkey.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "underwriter",
+            "in": "query",
+            "description": "Optional underwriter filter. Accepts `jupiter`, `flash_trade`,\n`phoenix`, or `gmtrade`. Other values yield 400.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "All open and recently-resolved orders for the wallet, across all 6 profile subaccounts. The `passthroughOrders` array carries every Imperial-routed resting order — Jupiter, Flash, Phoenix, and GMTrade alike — including TP/SL, limit, stop-limit, ratchet, DCA, and Phoenix native limits; the `jupiterOrders` array carries only Jupiter-native limit orders submitted through Jupiter's own (non-Imperial) limit-order program. Use this endpoint rather than `/passthrough/users/{wallet}/orders` when you want both classes in one call.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CombinedOrdersResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid wallet address"
+          }
+        }
+      }
+    },
+    "/api/v1/passthrough/users/{wallet}/orders": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_passthrough_orders",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "description": "Base58 wallet pubkey",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status: `pending`, `executed`, `cancelled`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Max orders to return.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "profile_index",
+            "in": "query",
+            "description": "Sub-account index (0..5).",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of passthrough orders (open, executed, cancelled)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PassthroughOrdersResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/passthrough/users/{wallet}/profiles/{index}/sync": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "operationId": "sync_profile_sweep",
+        "parameters": [
+          {
+            "name": "wallet",
+            "in": "path",
+            "description": "Owner wallet base58 pubkey",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "Sub-account index (0..5)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Idempotent sweep trigger. After closing positions, your profile may hold WSOL / WBTC / WETH residue (collateral returned in the market token rather than USDC). This endpoint asks the operator to swap those back to USDC and route the proceeds to the user wallet. Call after every Decrease that fully closes a non-USDC-collateralized position. Rate-limited per profile (~10s lock) — concurrent calls return `\"queued\"`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncSweepResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid wallet pubkey or out-of-range profile_index"
+          }
+        }
+      }
+    },
+    "/api/v1/phoenix/depth": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_phoenix_depth_summary",
+        "responses": {
+          "200": {
+            "description": "Live Phoenix orderbook snapshots keyed by Phoenix-raw symbol (e.g. `GOLD`, not the Imperial-canonical `XAU`). The cache holds a persistent WS connection to `wss://perp-api.phoenix.trade/ws`; entries are at most 60s stale.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DepthSummaryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/phoenix/mark-prices": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_phoenix_mark_prices",
+        "responses": {
+          "200": {
+            "description": "Per-symbol mid prices from the live Phoenix orderbook. Symbols are Phoenix-raw (e.g. `GOLD`, not `XAU`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PhoenixMarkPrice"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/phoenix/markets": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_phoenix_markets",
+        "responses": {
+          "200": {
+            "description": "Phoenix CLOB markets, keyed by Phoenix's raw symbol (e.g. `GOLD` not the Imperial-canonical `XAU`). Includes max leverage from the smallest tier, taker/maker fees in millionths, and the orderbook PDA.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PhoenixMarketResponse"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/phoenix/register": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "summary": "Activates a wallet's Phoenix profile under Imperial's referral code.",
+        "description": "**Intentionally unauthenticated.** Imperial's Phoenix invite quota is\neffectively unlimited, so we don't gate this on a wallet signature or JWT\n— adding friction (sign-message prompt, JWT exchange) for a no-cost\nactivation hurts UX without protecting anything that matters. The\nactivation is keyed on the profile PDA derived from `wallet`; the\nattacker-controlled wallet still has no on-chain authority over a\nstranger's profile, so the worst a third party can do is pre-register a\nwallet under our referral, which is exactly what we want anyway.\n\nDo NOT add auth here without first checking with the team — see the\nreview thread on phoenix-native.",
+        "operationId": "register_phoenix_trader",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterPhoenixRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Activates the Phoenix trader account for `(wallet, profileIndex)` under Imperial's referral. **Optional for bots**: `/mobile/orders` already auto-activates Phoenix on first use and caches the result. Use this endpoint only when you want to pre-activate from a UI flow or warm the cache before sending a latency-sensitive first Phoenix order. Idempotent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisterPhoenixResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid wallet pubkey"
+          },
+          "500": {
+            "description": "Phoenix activation upstream failed"
+          }
+        }
+      }
+    },
+    "/api/v1/pnl-history": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_pnl_history",
+        "parameters": [
+          {
+            "name": "walletAddress",
+            "in": "query",
+            "description": "Base58 Solana wallet pubkey.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "resolution",
+            "in": "query",
+            "description": "Bucket size. Accepts `1h` or `1d`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Inclusive start (unix seconds). Defaults to `now - 90d` for `1h` and\nthe wallet's earliest action for `1d` (within the underwriter filter\nwhen set).",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Inclusive end (unix seconds). Defaults to `now`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "underwriter",
+            "in": "query",
+            "description": "Optional underwriter filter. Accepts `jupiter`, `flash_trade`,\n`phoenix`, or `gmtrade`. Other values yield 400. When set, every\ncomponent (realized PnL, funding, taker fees, unrealized PnL) is\nscoped to that venue.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Time-bucketed PnL history for the wallet, aggregated across every profile PDA. One row per `[since, until]` bucket (continuous — empty buckets carry forward the prior cumulative values). `unrealizedPnl` is populated only on the last bucket; earlier buckets serialize as null because historical mark-to-market is not supported.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PnlHistoryPoint"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid wallet, resolution, range, or lookback exceeds the hourly cap (90 days)."
+          }
+        }
+      }
+    },
+    "/api/v1/positions": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "summary": "Get open position lifecycles across every underwriter (Jupiter, Flash,\nPhoenix, GMTrade), enriched with live PnL where available. Despite this\nfunction's name, the response is multi-venue — the historical name predates\nthe broader underwriter set.",
+        "operationId": "get_jupiter_positions_with_ownership",
+        "parameters": [
+          {
+            "name": "walletAddress",
+            "in": "query",
+            "description": "Base58 Solana wallet pubkey.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "underwriter",
+            "in": "query",
+            "description": "Optional underwriter filter. Accepts `jupiter`, `flash_trade`,\n`phoenix`, or `gmtrade`. Other values yield 400.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Open positions for the wallet across all profiles and underwriters, with live PnL, leverage, entry price, liquidation price, accrued fees, and any attached TP/SL/ratchet/DCA close orders. Numeric fields are stringified to preserve precision.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LifecyclesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid wallet address"
+          }
+        }
+      }
+    },
+    "/api/v1/priority-fee": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_priority_fee",
+        "responses": {
+          "200": {
+            "description": "Suggested Solana priority fee for trades against the passthrough program. Median over recent blocks, polled every 30s, capped at 500_000 micro-lamports.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PriorityFeeResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/route": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_route",
+        "parameters": [
+          {
+            "name": "asset",
+            "in": "query",
+            "description": "Canonical asset symbol (e.g. `SOL`, `BTC`, `XAU`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "side",
+            "in": "query",
+            "description": "`long` or `short`.",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Side"
+            }
+          },
+          {
+            "name": "notional",
+            "in": "query",
+            "description": "Trade notional in USD (collateral × leverage at entry).",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "desiredLeverage",
+            "in": "query",
+            "description": "Desired leverage multiplier (e.g. 5 = 5x).",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "holdHours",
+            "in": "query",
+            "description": "Expected hold period in hours. Defaults to 24h. Drives the borrow term\nand the Brownian first-passage probability used in the liquidation cost.",
+            "required": false,
+            "schema": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          {
+            "name": "dailyVol",
+            "in": "query",
+            "description": "Optional caller-supplied daily volatility (decimal, e.g. 0.04 = 4%/day).\nFalls back to the asset-class table when absent.",
+            "required": false,
+            "schema": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          {
+            "name": "stickyVenue",
+            "in": "query",
+            "description": "Optional sticky-venue override. If provided, the router treats this venue\nas already locked for the asset and returns it (clamped if leverage exceeds\nthe venue's cap). When `wallet` + `profileIndex` are present and `stickyVenue`\nis omitted, the sticky venue is auto-resolved from open lifecycles.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/Venue"
+                }
+              ]
+            }
+          },
+          {
+            "name": "subaccountDefaultVenue",
+            "in": "query",
+            "description": "Optional per-subaccount default-venue override. Used when no sticky venue\napplies and the asset is supported by the default venue at the requested\nleverage.",
+            "required": false,
+            "schema": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/components/schemas/Venue"
+                }
+              ]
+            }
+          },
+          {
+            "name": "wallet",
+            "in": "query",
+            "description": "Optional wallet (base58). When present along with `profileIndex`, the\nhandler queries `position_lifecycles` for an open position on this asset\nand uses that venue as the sticky.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "profileIndex",
+            "in": "query",
+            "description": "Optional sub-account index (0..5).",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            }
+          },
+          {
+            "name": "excludedVenues",
+            "in": "query",
+            "description": "Optional comma-separated list of venues the caller wants excluded\n(e.g. `excludedVenues=phoenix,gmtrade`). When omitted, the handler\nfalls back to `profile_names.excluded_venues` via `wallet` +\n`profile_index` if those are present. Sticky venues with open\npositions still route there even if excluded — open positions take\nprecedence over exclusions.",
+            "required": false,
+            "schema": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "$ref": "#/components/schemas/Venue"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Best venue for the trade plus a per-venue cost breakdown. `costBreakdown.expectedLiqCost = pLiq × LossGivenLiq(venue)`, where `pLiq` is the Brownian first-passage probability that the position hits its liquidation barrier within the requested `holdHours` window (default 24h): `pLiq = 2 × Φ(−d / σ_period)` with `d = 1/leverage − mmr` and `σ_period = dailyVol × √(holdHours / 24)`. Pass `holdHours` if your strategy holds positions for materially longer or shorter than a day.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query parameters"
+          },
+          "404": {
+            "description": "No venue supports this asset"
+          }
+        }
+      }
+    },
+    "/api/v1/stats/markets": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_stats_markets",
+        "parameters": [
+          {
+            "name": "period",
+            "in": "query",
+            "description": "Volume lookback window: `24h`, `7d`, or `30d`. Default: `24h`. OI is always a live snapshot.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Per-asset volume + open-interest breakdown. Symbols active in either source appear; missing fields zero-fill.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MarketsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/open-interest": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_stats_open_interest",
+        "parameters": [
+          {
+            "name": "grouping",
+            "in": "query",
+            "description": "Aggregation axis: `venue`, `asset`, `side`, or `venue_asset`. Default: `venue`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current open-interest snapshot. Each row carries long/short/total notional plus distinct-trader and position counts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenInterestResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/open-interest/history": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_stats_open_interest_history",
+        "parameters": [
+          {
+            "name": "period",
+            "in": "query",
+            "description": "Lookback window: `24h`, `7d`, `30d`, `90d`, `180d`, `1y`, or `all`. Default: `30d`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "grouping",
+            "in": "query",
+            "description": "Bucket size: `hour`, `day`, or `week`. Default: `hour` for 24h, `day` otherwise.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Historical open-interest time series, derived from the signed `tx2_size_usd_delta` event log (no snapshot table). `currentOiUsd` is the live truth — compare against the last row to spot indexer drift.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OiHistoryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/summary": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_stats_summary",
+        "responses": {
+          "200": {
+            "description": "Protocol-level snapshot: 24h/7d/all-time volume, current open interest, 24h active traders and fee revenue, plus a per-venue breakdown.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsSummaryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/stats/volume": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "operationId": "get_stats_volume",
+        "parameters": [
+          {
+            "name": "period",
+            "in": "query",
+            "description": "Lookback window: `24h`, `7d`, or `30d`. Default: `7d`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "grouping",
+            "in": "query",
+            "description": "Bucket size: `hour`, `day`, or `week`. Default: `hour` for 24h, `day` otherwise.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "venue",
+            "in": "query",
+            "description": "Restrict to one venue: `jupiter`, `flash`, `phoenix`, or `gmtrade`. Per-venue columns still split out all four (others zero-fill).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Time-series notional volume bucketed over the requested window. Volume counts opens/increases only — closes are excluded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VolumeResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "operationId": "get_status",
+        "responses": {
+          "200": {
+            "description": "Service health snapshot — always returns 200, inspect fields for the actual state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/trades": {
+      "get": {
+        "tags": [
+          "reads"
+        ],
+        "summary": "Get position lifecycles (open + closed) with their actions, paginated.\nMulti-venue: returns lifecycles across every underwriter — the function\nname is historical. Includes lazy background sync for Jupiter direct\npositions on stale wallets.",
+        "operationId": "get_jupiter_trades_with_ownership",
+        "parameters": [
+          {
+            "name": "walletAddress",
+            "in": "query",
+            "description": "Base58 Solana wallet pubkey.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size, capped at 200 server-side.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Pagination offset.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "underwriter",
+            "in": "query",
+            "description": "Optional underwriter filter. Accepts `jupiter`, `flash_trade`,\n`phoenix`, or `gmtrade`. Other values yield 400.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Position lifecycles for the wallet, newest first, paginated. Each lifecycle carries its full action history (entry, increases, decreases, close).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LifecyclesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid wallet address"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ActionResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "actionType",
+          "status",
+          "sequenceNumber",
+          "tx1Signature",
+          "tx1Timestamp",
+          "hadSwap"
+        ],
+        "properties": {
+          "actionType": {
+            "type": "string"
+          },
+          "collateralAfter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "collateralDelta": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "collateralDeposited": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entryPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failureReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hadSwap": {
+            "type": "boolean"
+          },
+          "hasProfit": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "interest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "jupiterFee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderCreatedAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "orderDcaEndPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderDcaIntervalSeconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "orderDcaLegNumber": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "orderDcaLegTrigger": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderDcaNumLegs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "orderDcaPriceLimit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderDcaStartPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderExecutionTriggerPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderIndicatorConfig": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderRatchetSize": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderSizeUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderSlippageBps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "orderThresholdValue": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderTriggerDelaySecs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "orderType": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderWaitDurationSecs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "orderWaitPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderWorstPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "platformFee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pnlRealized": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proOrderFee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sequenceNumber": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "sizeDelta": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sizeDeltaTokens": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "swapSlippage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "triggerCondition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "triggerPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tx1Signature": {
+            "type": "string"
+          },
+          "tx1Timestamp": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tx2Signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tx2Timestamp": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "tx3PlatformFee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tx3Signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tx3SwapFee": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tx3SweepSlippage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tx3Timestamp": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "userReceived": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "BuildDepositTxRequest": {
+        "type": "object",
+        "required": [
+          "wallet",
+          "profileIndex",
+          "amount",
+          "mode"
+        ],
+        "properties": {
+          "amount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Deposit amount in USDC native units (6-decimal — `1_000_000` = $1).",
+            "minimum": 0
+          },
+          "mode": {
+            "type": "string",
+            "description": "`\"deposit\"` to credit USDC directly from the wallet's USDC ATA into the\nprofile's USDC ATA, or `\"withdraw\"` to pull USDC out of the profile back\nto the wallet's USDC ATA. Funding from native SOL is not supported —\nwrap to WSOL on the client first."
+          },
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sub-account index (0..5) the deposit lands in.",
+            "minimum": 0
+          },
+          "wallet": {
+            "type": "string",
+            "description": "Owner wallet base58 pubkey. The returned tx is partially signed by the\norder-bot operator (sponsoring rent + ATA creation) and must be signed\nby this wallet before submission."
+          }
+        }
+      },
+      "BuildDepositTxResponse": {
+        "type": "object",
+        "required": [
+          "transaction"
+        ],
+        "properties": {
+          "transaction": {
+            "type": "string",
+            "description": "Base64-encoded `VersionedTransaction`. Decode, sign with the wallet's\nkeypair, and submit via your usual RPC."
+          }
+        }
+      },
+      "CombinedOrdersResponse": {
+        "type": "object",
+        "required": [
+          "jupiterOrders",
+          "passthroughOrders",
+          "totalCount"
+        ],
+        "properties": {
+          "jupiterOrders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnhancedJupiterOrder"
+            }
+          },
+          "passthroughOrders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PassthroughOrderInfo"
+            }
+          },
+          "totalCount": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "CostBreakdown": {
+        "type": "object",
+        "required": [
+          "openFee",
+          "closeFee",
+          "openSlip",
+          "closeSlip",
+          "borrow",
+          "expectedLiqCost",
+          "pLiq",
+          "total"
+        ],
+        "properties": {
+          "borrow": {
+            "type": "number",
+            "format": "double"
+          },
+          "closeFee": {
+            "type": "number",
+            "format": "double",
+            "description": "Close fee weighted by `(1 − pLiq)` — expected amount paid on voluntary close."
+          },
+          "closeSlip": {
+            "type": "number",
+            "format": "double",
+            "description": "Close slippage weighted by `(1 − pLiq)`."
+          },
+          "expectedLiqCost": {
+            "type": "number",
+            "format": "double",
+            "description": "`pLiq × LossGivenLiq(venue)`."
+          },
+          "openFee": {
+            "type": "number",
+            "format": "double"
+          },
+          "openSlip": {
+            "type": "number",
+            "format": "double"
+          },
+          "pLiq": {
+            "type": "number",
+            "format": "double"
+          },
+          "total": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "DepthLevel": {
+        "type": "object",
+        "required": [
+          "price",
+          "sizeBase"
+        ],
+        "properties": {
+          "price": {
+            "type": "number",
+            "format": "double"
+          },
+          "sizeBase": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "DepthSnapshot": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "mid",
+          "bids",
+          "asks",
+          "fetchedAt"
+        ],
+        "properties": {
+          "asks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DepthLevel"
+            }
+          },
+          "bids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DepthLevel"
+            }
+          },
+          "fetchedAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock time the most recent message landed, in milliseconds since\nthe unix epoch. Use this to gate routing on freshness (drop Phoenix\nwhen `now − fetched_at > STALE_THRESHOLD_MS`)."
+          },
+          "mid": {
+            "type": "number",
+            "format": "double"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "DepthSummaryResponse": {
+        "type": "object",
+        "required": [
+          "snapshots"
+        ],
+        "properties": {
+          "snapshots": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/DepthSnapshot"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "EnhancedJupiterOrder": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/JupiterLimitOrder"
+          },
+          {
+            "type": "object",
+            "required": [
+              "ownership",
+              "source"
+            ],
+            "properties": {
+              "ownership": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "FeeBreakdown": {
+        "type": "object",
+        "required": [
+          "platformFee",
+          "swapFee",
+          "slippage",
+          "jupiterFee",
+          "interest",
+          "proOrderFee"
+        ],
+        "properties": {
+          "interest": {
+            "type": "string"
+          },
+          "jupiterFee": {
+            "type": "string"
+          },
+          "platformFee": {
+            "type": "string"
+          },
+          "proOrderFee": {
+            "type": "string"
+          },
+          "slippage": {
+            "type": "string"
+          },
+          "swapFee": {
+            "type": "string"
+          }
+        }
+      },
+      "FlashMarketResponse": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "side",
+          "underwriter",
+          "marketAddress",
+          "poolAddress",
+          "poolName",
+          "targetCustody",
+          "targetMint",
+          "targetOracle",
+          "collateralCustody",
+          "collateralMint",
+          "collateralOracle",
+          "collateralCustodyTokenAccount",
+          "priceExponent",
+          "tokenDecimals",
+          "allowOpenPosition",
+          "allowClosePosition"
+        ],
+        "properties": {
+          "allowClosePosition": {
+            "type": "boolean"
+          },
+          "allowOpenPosition": {
+            "type": "boolean"
+          },
+          "collateralCustody": {
+            "type": "string"
+          },
+          "collateralCustodyTokenAccount": {
+            "type": "string"
+          },
+          "collateralIsToken2022": {
+            "type": "boolean"
+          },
+          "collateralMint": {
+            "type": "string"
+          },
+          "collateralOracle": {
+            "type": "string"
+          },
+          "marketAddress": {
+            "type": "string"
+          },
+          "maxConfBps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "maxLeverage": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "openPositionFeeRate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "poolAddress": {
+            "type": "string"
+          },
+          "poolName": {
+            "type": "string"
+          },
+          "priceExponent": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pythHermesFeedId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pythLazerId": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "pythLazerSymbol": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "side": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "targetCustody": {
+            "type": "string"
+          },
+          "targetMint": {
+            "type": "string"
+          },
+          "targetOracle": {
+            "type": "string"
+          },
+          "tokenDecimals": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "underwriter": {
+            "type": "string"
+          },
+          "volatilityFeeRate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      },
+      "GmTradeFundingRatesResponse": {
+        "type": "object",
+        "description": "Per-symbol funding/borrow/net rates for the bot use case. All fields are\npercentages (0.04 = 0.04%) at hourly cadence, sourced from the GMTrade WS\n`indexTokens` feed and refreshed every 5 minutes. Sign convention follows\nGMTrade's: a positive `longFundingRatePerHourPercent` means longs pay shorts.",
+        "required": [
+          "symbol",
+          "longFundingRatePerHourPercent",
+          "shortFundingRatePerHourPercent",
+          "longBorrowRatePerHourPercent",
+          "shortBorrowRatePerHourPercent",
+          "longNetRatePerHourPercent",
+          "shortNetRatePerHourPercent",
+          "openFeePositivePercent",
+          "openFeeNegativePercent"
+        ],
+        "properties": {
+          "longBorrowRatePerHourPercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "longFundingRatePerHourPercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "longNetRatePerHourPercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "openFeeNegativePercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "openFeePositivePercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "shortBorrowRatePerHourPercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "shortFundingRatePerHourPercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "shortNetRatePerHourPercent": {
+            "type": "number",
+            "format": "double"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "GmTradeLiquidityResponse": {
+        "type": "object",
+        "description": "Per-symbol pool headroom (USD) for the preferred (open, USDC-collateral\nfirst) market variant. `null` on either side means the on-chain liquidity\npoller hasn't seen that symbol yet, or the data couldn't be parsed.",
+        "required": [
+          "symbol"
+        ],
+        "properties": {
+          "longAvailableUsd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "shortAvailableUsd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "GmTradeMarketResponse": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "underwriter",
+          "market",
+          "marketTokenMint",
+          "indexTokenMint",
+          "longTokenMint",
+          "shortTokenMint",
+          "longTokenVault",
+          "shortTokenVault",
+          "oracle",
+          "indexTokenDecimals",
+          "closed"
+        ],
+        "properties": {
+          "closed": {
+            "type": "boolean"
+          },
+          "indexTokenDecimals": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "indexTokenMint": {
+            "type": "string"
+          },
+          "longTokenMint": {
+            "type": "string"
+          },
+          "longTokenVault": {
+            "type": "string"
+          },
+          "market": {
+            "type": "string"
+          },
+          "marketTokenMint": {
+            "type": "string"
+          },
+          "oracle": {
+            "type": "string"
+          },
+          "shortTokenMint": {
+            "type": "string"
+          },
+          "shortTokenVault": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "underwriter": {
+            "type": "string"
+          }
+        }
+      },
+      "JupiterLimitOrder": {
+        "type": "object",
+        "required": [
+          "collateralMint",
+          "collateralUsd",
+          "collateralUsdAtTriggerPrice",
+          "collateralTokenAmount",
+          "executed",
+          "inputMint",
+          "liquidationPriceUsd",
+          "marketMint",
+          "maxSizeUsdDelta",
+          "maxSizeUsdDeltaFormatted",
+          "minSizeUsdDelta",
+          "minSizeUsdDeltaFormatted",
+          "openTime",
+          "positionPubkey",
+          "positionRequestPubkey",
+          "side",
+          "sizeUsd",
+          "triggerPrice"
+        ],
+        "properties": {
+          "collateralMint": {
+            "type": "string"
+          },
+          "collateralTokenAmount": {
+            "type": "string"
+          },
+          "collateralUsd": {
+            "type": "string"
+          },
+          "collateralUsdAtTriggerPrice": {
+            "type": "string"
+          },
+          "executed": {
+            "type": "boolean"
+          },
+          "inputMint": {
+            "type": "string"
+          },
+          "liquidationPriceUsd": {
+            "type": "string"
+          },
+          "marketMint": {
+            "type": "string"
+          },
+          "maxSizeUsdDelta": {
+            "type": "string"
+          },
+          "maxSizeUsdDeltaFormatted": {
+            "type": "string"
+          },
+          "minSizeUsdDelta": {
+            "type": "string"
+          },
+          "minSizeUsdDeltaFormatted": {
+            "type": "string"
+          },
+          "openTime": {
+            "type": "string"
+          },
+          "positionPubkey": {
+            "type": "string"
+          },
+          "positionRequestPubkey": {
+            "type": "string"
+          },
+          "side": {
+            "type": "string"
+          },
+          "sizeUsd": {
+            "type": "string"
+          },
+          "triggerPrice": {
+            "type": "string"
+          },
+          "triggerToLiquidationPercent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "LifecycleResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "positionPda",
+          "wallet",
+          "source",
+          "side",
+          "asset",
+          "totalFeesUsd",
+          "fees",
+          "status",
+          "openedAt",
+          "lastActionAt",
+          "underwriter",
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActionResponse"
+            }
+          },
+          "asset": {
+            "type": "string"
+          },
+          "borrowFeeOwed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closeFeeOwed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closedAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "collateralUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "entryPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fees": {
+            "$ref": "#/components/schemas/FeeBreakdown"
+          },
+          "feesOwed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fundingRateHourlyPercent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "lastActionAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "leverageX": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "liquidationPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "markPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxCollateralUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxLeverageX": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxSizeUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "openedAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pnlPercent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pnlUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "positionPda": {
+            "type": "string"
+          },
+          "profileIndex": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "profilePictureUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "side": {
+            "type": "string"
+          },
+          "sizeTokenAmount": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sizeUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "swapFeeOwed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "totalFeesUsd": {
+            "type": "string"
+          },
+          "tpslOrders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TpSlOrderResponse"
+            }
+          },
+          "underwriter": {
+            "type": "string"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wallet": {
+            "type": "string"
+          }
+        }
+      },
+      "LifecyclesResponse": {
+        "type": "object",
+        "required": [
+          "dataList",
+          "count",
+          "totalCount",
+          "lifetimeCollateralUsd",
+          "lifetimePnlUsd",
+          "lifetimeFeesUsd",
+          "lifetimeFeeBreakdown"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "dataList": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleResponse"
+            }
+          },
+          "lifetimeCollateralUsd": {
+            "type": "string"
+          },
+          "lifetimeFeeBreakdown": {
+            "$ref": "#/components/schemas/FeeBreakdown"
+          },
+          "lifetimeFeesUsd": {
+            "type": "string"
+          },
+          "lifetimePnlUsd": {
+            "type": "string"
+          },
+          "totalCount": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "MarketRow": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "volumeUsd",
+          "openInterestUsd",
+          "longOiUsd",
+          "shortOiUsd",
+          "traderCount",
+          "positionCount",
+          "byVenue"
+        ],
+        "properties": {
+          "byVenue": {
+            "$ref": "#/components/schemas/MarketVenueVolume"
+          },
+          "longOiUsd": {
+            "type": "string"
+          },
+          "openInterestUsd": {
+            "type": "string"
+          },
+          "positionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "shortOiUsd": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "traderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "volumeUsd": {
+            "type": "string"
+          }
+        }
+      },
+      "MarketVenueVolume": {
+        "type": "object",
+        "required": [
+          "jupiterUsd",
+          "flashUsd",
+          "phoenixUsd",
+          "gmtradeUsd"
+        ],
+        "properties": {
+          "flashUsd": {
+            "type": "string"
+          },
+          "gmtradeUsd": {
+            "type": "string"
+          },
+          "jupiterUsd": {
+            "type": "string"
+          },
+          "phoenixUsd": {
+            "type": "string"
+          }
+        }
+      },
+      "MarketsResponse": {
+        "type": "object",
+        "required": [
+          "period",
+          "rows"
+        ],
+        "properties": {
+          "period": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MarketRow"
+            }
+          }
+        }
+      },
+      "MobileBalancesResponse": {
+        "type": "object",
+        "required": [
+          "wallet",
+          "profiles"
+        ],
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileUsdcBalance"
+            },
+            "description": "One entry per Imperial subaccount (profile_index 0..5), in order."
+          },
+          "wallet": {
+            "type": "string"
+          }
+        }
+      },
+      "MobileCancelOrderRequest": {
+        "type": "object",
+        "required": [
+          "wallet",
+          "orderPda",
+          "profileIndex"
+        ],
+        "properties": {
+          "orderPda": {
+            "type": "string",
+            "description": "Base58 PDA of the order to cancel."
+          },
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sub-account index (0..5) the order belongs to.",
+            "minimum": 0
+          },
+          "wallet": {
+            "type": "string",
+            "description": "Base58 wallet pubkey. Must match the JWT's wallet claim."
+          }
+        }
+      },
+      "MobileCollateralEditRequest": {
+        "type": "object",
+        "required": [
+          "wallet",
+          "marketMint",
+          "side",
+          "action",
+          "collateralAmount",
+          "slippageBps",
+          "profileIndex",
+          "underwriter",
+          "price"
+        ],
+        "properties": {
+          "action": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 = add collateral, 1 = remove collateral.",
+            "minimum": 0
+          },
+          "collateralAmount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Amount of collateral to add or remove, in the collateral mint's native units.",
+            "minimum": 0
+          },
+          "marketMint": {
+            "type": "string",
+            "description": "Base58 SPL mint of the market whose position is being adjusted."
+          },
+          "price": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Client-observed market price, oracle scale (1e9).",
+            "minimum": 0
+          },
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sub-account index (0..5).",
+            "minimum": 0
+          },
+          "side": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 = long, 1 = short.",
+            "minimum": 0
+          },
+          "slippageBps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Slippage tolerance in basis points.",
+            "minimum": 0
+          },
+          "underwriter": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 = Jupiter, 1 = Flash Trade, 2 = Phoenix, 3 = GMTrade. (4 reserved\nfor Pacifica.) Wire format mirrors `passthrough_client::Underwriter`.",
+            "minimum": 0
+          },
+          "wallet": {
+            "type": "string",
+            "description": "Base58 wallet pubkey. Must match the JWT's wallet claim."
+          }
+        }
+      },
+      "MobileConnectRequest": {
+        "type": "object",
+        "required": [
+          "wallet",
+          "message",
+          "signature"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Plain message the wallet signed. Must be `imperial:mobile-connect:{wallet}:{nonce}`."
+          },
+          "signature": {
+            "type": "string",
+            "description": "Base58-encoded signature over `message` by `wallet`'s private key."
+          },
+          "wallet": {
+            "type": "string",
+            "description": "Base58 Solana wallet pubkey"
+          }
+        }
+      },
+      "MobileConnectResponse": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "One-time code to exchange for a JWT via `/mobile/exchange` within 5 minutes."
+          }
+        }
+      },
+      "MobileCreateOrderBatchRequest": {
+        "type": "object",
+        "required": [
+          "entry"
+        ],
+        "properties": {
+          "closeOrders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MobileCreateOrderRequest"
+            },
+            "description": "Close-side legs (TP, SL, ratchet, DCA-close, ...) attached to the entry.\nEach must have `action == 1` and match the entry's\n`(wallet, marketMint, side, underwriter, profileIndex)` tuple."
+          },
+          "entry": {
+            "$ref": "#/components/schemas/MobileCreateOrderRequest",
+            "description": "The entry order. Must have `action == 0` (Increase)."
+          }
+        }
+      },
+      "MobileCreateOrderBatchResponse": {
+        "type": "object",
+        "required": [
+          "entry",
+          "closeOrders"
+        ],
+        "properties": {
+          "closeOrders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MobileOrderResponse"
+            },
+            "description": "One result per close leg, in input order. Empty if the entry failed."
+          },
+          "entry": {
+            "$ref": "#/components/schemas/MobileOrderResponse",
+            "description": "Result of the entry submission. `success = false` skips the close legs."
+          }
+        }
+      },
+      "MobileCreateOrderRequest": {
+        "type": "object",
+        "required": [
+          "wallet",
+          "side",
+          "orderType",
+          "action",
+          "triggerCondition",
+          "sizeUsd",
+          "collateralAmount",
+          "slippageBps",
+          "triggerPrice",
+          "profileIndex",
+          "priority",
+          "fundingStatus",
+          "underwriter"
+        ],
+        "properties": {
+          "action": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 = Increase, 1 = Decrease.",
+            "minimum": 0
+          },
+          "collateralAmount": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Collateral amount in the collateral mint's native units.",
+            "minimum": 0
+          },
+          "extraData": {
+            "description": "Per-order-type parameters (e.g. `{ \"worstPrice\": ..., \"ratchetSize\": ... }`\nfor ratchet orders; `{ \"dcaNumLegs\": ..., \"dcaIntervalSeconds\": ... }` for DCA)."
+          },
+          "fundingStatus": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Funding mode: 0 = funded at creation (collateral debited from the profile immediately),\n1 = pending (the order is created without collateral and the order-bot funder tops it up\nasynchronously). Most integrators want 0.",
+            "minimum": 0
+          },
+          "marketMint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base58 SPL mint of the market (e.g. SOL mint for SOL-PERP). Either this\nor `symbol` must be set; if both are provided, `marketMint` wins.\nUse `symbol` instead unless you already have a venue-specific mint and\nwant to skip the server-side lookup."
+          },
+          "marketPrice": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Client-observed market price (oracle scale, 1e9) at the moment the order was placed.\nForwarded to the on-chain market-order instruction so the program can enforce slippage\nagainst an agreed-upon reference price. Ignored for resting orders.",
+            "minimum": 0
+          },
+          "orderType": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0=Market, 1=Limit, 2=StopLimit, 3=LandMine, 4=Ratchet, 6=RatchetEntry, 9=DCA,\n10=FibRatchet, 11=FibRatchetEntry, 12=DcaClose, 13=DcaTimeClose,\n14=DcaRatchetClose, 15=DcaTime, 16=DcaRatchet.",
+            "minimum": 0
+          },
+          "parentOrderPda": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional Order PDA of the parent limit order this close order is\nattached to. Set this when adding a TP/SL/Trailing to a still-resting\nlimit so the UI groups it under that limit (instead of relying on the\n`(market, side, profile)` heuristic, which mis-groups close orders\nacross unrelated parents on the same key). NULL for standalone close\norders (i.e. attached to an open position) and for entry orders."
+          },
+          "phoenixNative": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Opt into Phoenix's native CLOB for this order instead of the\nkeeper-managed IOC fallback. Only meaningful when `underwriter = 2`\n(Phoenix) AND `orderType` is `Limit` (1) with `action = Increase` (0),\nor `PrivateTpSl` (5). Ignored for any other shape.\n\nDefault behavior (unset / `false`): the API rewrites Phoenix Limit /\nPrivateTpSl to StopLimit so the order routes through the keeper path.\nThat dodges a class of indexer + orderbook-watcher bugs that have\nstranded user collateral in the past (cancel-cleanup races, slot\nclassification edges).\n\nSet `true` only if you understand those risks and need genuine resting\nCLOB orders — e.g. maker-fee arbitrage bots. Orders placed with\n`phoenixNative = true` will not be rewritten and will rest natively on\nthe Phoenix orderbook."
+          },
+          "priority": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Funding-queue ranking for resting orders. Lower value = higher priority (0 is highest).\nUsed by the order-bot funder to decide which `funding_status=1` orders to top up first\nwhen the profile has constrained balance. Has no effect on Solana priority fees.",
+            "minimum": 0
+          },
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sub-account index (0..5). Each profile is an isolated margin account.",
+            "minimum": 0
+          },
+          "side": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 = long, 1 = short.",
+            "minimum": 0
+          },
+          "sizeUsd": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Position size in USD, 6-decimal fixed point (1_000_000 = $1).",
+            "minimum": 0
+          },
+          "slippageBps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Slippage tolerance in basis points (100 = 1%).",
+            "minimum": 0
+          },
+          "symbol": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Canonical Imperial symbol (e.g. `\"SOL\"`, `\"XAU\"`). Resolved server-side\nto the right `marketMint` for the requested `underwriter` — this is the\nrecommended addressing path: the same symbol you read from\n`/funding-rates` works directly here, including Phoenix synthetics\n(XAU, SPY, EUR, GBP, …) that have no SPL mint of their own."
+          },
+          "triggerCondition": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 = Above, 1 = Below. Direction of trigger condition relative to price.",
+            "minimum": 0
+          },
+          "triggerPrice": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Trigger price in oracle scale (1e9). Required for non-market orders.",
+            "minimum": 0
+          },
+          "underwriter": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 = Jupiter, 1 = Flash Trade, 2 = Phoenix, 3 = GMTrade. (4 reserved\nfor Pacifica.) Wire format mirrors `passthrough_client::Underwriter`.",
+            "minimum": 0
+          },
+          "wallet": {
+            "type": "string",
+            "description": "Base58 wallet pubkey. Must match the JWT's wallet claim."
+          }
+        }
+      },
+      "MobileExchangeRequest": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "One-time code returned by `/mobile/connect`."
+          }
+        }
+      },
+      "MobileExchangeResponse": {
+        "type": "object",
+        "required": [
+          "jwt",
+          "expiresAt"
+        ],
+        "properties": {
+          "expiresAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp (seconds) when the JWT expires.",
+            "minimum": 0
+          },
+          "jwt": {
+            "type": "string",
+            "description": "JWT. Pass as `Authorization: Bearer <jwt>` on trading endpoints."
+          }
+        }
+      },
+      "MobileOrderResponse": {
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Humanized error message when `success` is false."
+          },
+          "orderPda": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base58 Order PDA for **resting orders only** (limit, stop-limit, ratchet,\nDCA, Phoenix native, etc.) — `None` for market orders, which open a\nposition rather than rest. Use this for downstream `/mobile/orders/cancel`\nor `/mobile/orders/update` calls without polling the indexer to discover\nthe PDA. Deterministic — derived from the profile PDA + the\n`user_account.order_counter` snapshot at placement."
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Solana transaction signature, if one was produced."
+          },
+          "success": {
+            "type": "boolean",
+            "description": "True if the order bot accepted the request."
+          }
+        }
+      },
+      "MobileProOrderUpdate": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "ratchetSize": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "type": {
+            "type": "string",
+            "description": "One of: `ratchet`, `landMine`."
+          },
+          "waitDurationSeconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "waitPrice": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "worstPrice": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "MobileUpdateOrderRequest": {
+        "type": "object",
+        "required": [
+          "wallet",
+          "orderPda",
+          "profileIndex"
+        ],
+        "properties": {
+          "closeBps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "For decrease orders: new close percentage in bps (0..10000). Omit to leave unchanged.",
+            "minimum": 0
+          },
+          "orderPda": {
+            "type": "string",
+            "description": "Base58 PDA of the order to update."
+          },
+          "priority": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "New Solana priority fee tier. Omit to leave unchanged.",
+            "minimum": 0
+          },
+          "proOrderUpdate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MobileProOrderUpdate",
+                "description": "Per-type parameter update for advanced orders (ratchet / land-mine)."
+              }
+            ]
+          },
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sub-account index (0..5).",
+            "minimum": 0
+          },
+          "sizeUsd": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "New size in USD. Omit to leave unchanged.",
+            "minimum": 0
+          },
+          "slippageBps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "New slippage tolerance (bps). Omit to leave unchanged.",
+            "minimum": 0
+          },
+          "triggerPrice": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "New trigger price (oracle scale). Omit to leave unchanged.",
+            "minimum": 0
+          },
+          "wallet": {
+            "type": "string",
+            "description": "Base58 wallet pubkey. Must match the JWT's wallet claim."
+          }
+        }
+      },
+      "OiHistoryPeak": {
+        "type": "object",
+        "required": [
+          "timestamp",
+          "oiUsd"
+        ],
+        "properties": {
+          "oiUsd": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "OiHistoryPoint": {
+        "type": "object",
+        "required": [
+          "timestamp",
+          "oiUsd"
+        ],
+        "properties": {
+          "oiUsd": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "OiHistoryResponse": {
+        "type": "object",
+        "required": [
+          "period",
+          "grouping",
+          "currentOiUsd",
+          "rows"
+        ],
+        "properties": {
+          "currentOiUsd": {
+            "type": "string",
+            "description": "Live current open interest (sum of `status='open'` lifecycles). Compare\nagainst `rows`' last entry — divergence indicates indexer drift, not\narithmetic error in this endpoint."
+          },
+          "grouping": {
+            "type": "string"
+          },
+          "peak": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OiHistoryPeak"
+              }
+            ]
+          },
+          "period": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OiHistoryPoint"
+            }
+          }
+        }
+      },
+      "OpenInterestResponse": {
+        "type": "object",
+        "required": [
+          "grouping",
+          "asOf",
+          "rows"
+        ],
+        "properties": {
+          "asOf": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "grouping": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OpenInterestRow"
+            }
+          }
+        }
+      },
+      "OpenInterestRow": {
+        "type": "object",
+        "required": [
+          "label",
+          "longUsd",
+          "shortUsd",
+          "totalUsd",
+          "traderCount",
+          "positionCount"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "longUsd": {
+            "type": "string"
+          },
+          "positionCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "shortUsd": {
+            "type": "string"
+          },
+          "totalUsd": {
+            "type": "string"
+          },
+          "traderCount": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "PassthroughOrderInfo": {
+        "type": "object",
+        "required": [
+          "orderPda",
+          "wallet",
+          "marketMint",
+          "side",
+          "orderType",
+          "action",
+          "sizeUsd",
+          "collateralAmount",
+          "slippageBps",
+          "status",
+          "creationSignature",
+          "creationSlot",
+          "createdAt",
+          "profileIndex",
+          "priority",
+          "fundingStatus",
+          "underwriter"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "collateralAmount": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "creationSignature": {
+            "type": "string"
+          },
+          "creationSlot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Solana slot at which the placement tx landed. The FE compares this\nagainst the slot of its locally-cached Phoenix orderbook snapshot\nbefore classifying a missing slot as \"removed from book\" — a\nsnapshot from a slot before this one couldn't have observed the\nplacement yet."
+          },
+          "currentBestPriceUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fundingStatus": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "marketMint": {
+            "type": "string"
+          },
+          "orderData": {},
+          "orderPda": {
+            "type": "string"
+          },
+          "orderType": {
+            "type": "string"
+          },
+          "parentOrderPda": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Order PDA of the parent limit, when this is a close order (TP/SL/\nTrailing) attached to a still-resting limit. The FE uses this\ninstead of the legacy `(market, side, profile)` heuristic to group\nclose orders under their parent. `None` for entry orders and for\nclose orders attached to an open position."
+          },
+          "priority": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "side": {
+            "type": "string"
+          },
+          "sizeUsd": {
+            "type": "string"
+          },
+          "slippageBps": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "status": {
+            "type": "string"
+          },
+          "triggerCondition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "triggerPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "underwriter": {
+            "type": "string"
+          },
+          "venueOrderState": {
+            "description": "Per-venue resting state — Phoenix native carries (price_in_ticks,\norder_sequence_number, initial_base_lots, remaining_base_lots,\ntrader_account_pda) so the FE can subscribe to the orderbook and\nrender live partial-fill progress. None for venues with no\nresting state."
+          },
+          "wallet": {
+            "type": "string"
+          }
+        }
+      },
+      "PassthroughOrderResponse": {
+        "type": "object",
+        "required": [
+          "orderPda",
+          "wallet",
+          "profilePda",
+          "marketMint",
+          "side",
+          "orderType",
+          "action",
+          "sizeUsd",
+          "collateralAmount",
+          "slippageBps",
+          "status",
+          "creationSignature",
+          "creationSlot",
+          "createdAt",
+          "profileIndex",
+          "underwriter"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "cancelledAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "collateralAmount": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "creationSignature": {
+            "type": "string"
+          },
+          "creationSlot": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Solana slot at which the placement tx landed. The FE compares this\nagainst the slot of its locally-cached Phoenix orderbook snapshot\nbefore deciding the order is \"gone from book\" — a snapshot from a\nslot before this one couldn't have observed the placement, so we\nmust NOT classify a missing slot in that snapshot as a removal."
+          },
+          "executedAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "executionSignature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "marketMint": {
+            "type": "string"
+          },
+          "orderData": {},
+          "orderPda": {
+            "type": "string"
+          },
+          "orderType": {
+            "type": "string"
+          },
+          "parentOrderPda": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Order PDA of the parent limit, when this is a close order (TP/SL/\nTrailing) attached to a still-resting limit. The FE uses this\ninstead of the legacy `(market, side, profile)` heuristic to group\nclose orders under their parent — explicit links don't mis-attach\nacross markets/profiles. `None` for entry orders and for close\norders attached to an open position."
+          },
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "profilePda": {
+            "type": "string"
+          },
+          "side": {
+            "type": "string"
+          },
+          "sizeUsd": {
+            "type": "string"
+          },
+          "slippageBps": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "status": {
+            "type": "string"
+          },
+          "triggerCondition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "triggerPrice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "underwriter": {
+            "type": "string"
+          },
+          "venueOrderState": {
+            "description": "Per-venue runtime state of the resting order. For Phoenix-native\nlimits this carries `(price_in_ticks, order_sequence_number,\nremaining_base_lots, trader_account_pda, …)` — the FE uses these\nto scan the Phoenix orderbook account directly and render live\nfill progress (X of Y filled). `None` for venues with no resting\nstate (Jupiter / Flash IOC fills, Phoenix native that hasn't\nlanded on the book yet)."
+          },
+          "wallet": {
+            "type": "string"
+          }
+        }
+      },
+      "PassthroughOrdersResponse": {
+        "type": "object",
+        "required": [
+          "orders",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "orders": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PassthroughOrderResponse"
+            }
+          }
+        }
+      },
+      "PhoenixMarkPrice": {
+        "type": "object",
+        "description": "Mid-price snapshot per Phoenix-raw symbol. The mid is `(best_bid + best_ask) / 2`\nfrom the live orderbook WS feed, computed in `handle_text` and stored on the\nsnapshot. Empty until the WS connection has received its first orderbook\nmessage; stale entries (no message in 60s) are filtered by `get_fresh`.",
+        "required": [
+          "symbol",
+          "mid",
+          "fetchedAt"
+        ],
+        "properties": {
+          "fetchedAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock time the most recent message landed, in milliseconds since epoch."
+          },
+          "mid": {
+            "type": "number",
+            "format": "double"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "PhoenixMarketResponse": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "underwriter",
+          "orderbook",
+          "perpAssetMap",
+          "splineCollection",
+          "withdrawQueue",
+          "globalTraderIndex",
+          "activeTraderBuffer",
+          "assetId",
+          "subaccountIndex",
+          "baseLotsDecimals",
+          "tickSizeInQuoteLotsPerBaseLot",
+          "makerFeeMicro",
+          "takerFeeMicro",
+          "maxLeverage",
+          "maxSizeBaseLots"
+        ],
+        "properties": {
+          "activeTraderBuffer": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "assetId": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "baseLotsDecimals": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Signed because Phoenix publishes negative values for some markets\n(e.g. PUMP = -2). Mirrors `PhoenixMarketInfo.base_lots_decimals`."
+          },
+          "globalTraderIndex": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "makerFeeMicro": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "maxLeverage": {
+            "type": "number",
+            "format": "double",
+            "description": "Max leverage from the first (smallest position) tier"
+          },
+          "maxSizeBaseLots": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Max position size in base lots from the first tier",
+            "minimum": 0
+          },
+          "orderbook": {
+            "type": "string"
+          },
+          "perpAssetMap": {
+            "type": "string"
+          },
+          "splineCollection": {
+            "type": "string"
+          },
+          "subaccountIndex": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "takerFeeMicro": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "tickSizeInQuoteLotsPerBaseLot": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "underwriter": {
+            "type": "string"
+          },
+          "withdrawQueue": {
+            "type": "string"
+          }
+        }
+      },
+      "PnlHistoryPoint": {
+        "type": "object",
+        "required": [
+          "timestamp",
+          "cumulativePnl",
+          "cumulativeFundingPayment",
+          "cumulativeTakerFee"
+        ],
+        "properties": {
+          "cumulativeFundingPayment": {
+            "type": "number",
+            "format": "double",
+            "description": "Cumulative funding/interest paid (Phoenix funding + Jupiter borrow\nrate + GMTrade funding). Signed: positive = paid out by trader."
+          },
+          "cumulativePnl": {
+            "type": "number",
+            "format": "double",
+            "description": "Realized PnL accumulated up to and including this bucket. USD float."
+          },
+          "cumulativeTakerFee": {
+            "type": "number",
+            "format": "double",
+            "description": "Cumulative taker / order / venue execution fees across underwriters.\nExcludes Imperial's platform fee and DEX swap fees."
+          },
+          "timestamp": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bucket start, unix seconds."
+          },
+          "unrealizedPnl": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Mark-to-market PnL of currently open positions at the time of the\nrequest. **Only present on the last bucket** — historical\nmark-to-market is not supported because we do not persist historical\nmark prices. All earlier buckets serialize this field as `null`."
+          }
+        }
+      },
+      "PriceSource": {
+        "type": "string",
+        "enum": [
+          "phoenix_orderbook_ws",
+          "flash_custody_oracle",
+          "jupiter_doves_oracle",
+          "gmtrade_ws"
+        ]
+      },
+      "PriorityFeeResponse": {
+        "type": "object",
+        "required": [
+          "priority_fee"
+        ],
+        "properties": {
+          "priority_fee": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Median Solana priority fee (micro-lamports per CU) observed across\nrecent blocks that touched the passthrough program. Polled every 30s\nand clamped to a 500_000 ceiling so a stuck whale doesn't make the\nsuggestion useless. Field is `priority_fee` (snake_case) — this\nendpoint predates the camelCase convention and stays as-is for\nexisting integrators.",
+            "minimum": 0
+          }
+        }
+      },
+      "ProfileUsdcBalance": {
+        "type": "object",
+        "required": [
+          "profileIndex",
+          "profilePda",
+          "usdc"
+        ],
+        "properties": {
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "profilePda": {
+            "type": "string"
+          },
+          "usdc": {
+            "type": "integer",
+            "format": "int64",
+            "description": "USDC balance held in the profile's USDC ATA, in raw native units\n(6-decimal — divide by `1_000_000` for whole USDC). `0` when the ATA\nhasn't been created yet.",
+            "minimum": 0
+          }
+        }
+      },
+      "RateSource": {
+        "type": "string",
+        "description": "Provenance tag for a per-venue rate entry. Helps a bot author distinguish\nlive data from fallbacks without parsing free-form text.",
+        "enum": [
+          "jupiter_api_pool_info",
+          "gmtrade_ws",
+          "phoenix_clob_no_snapshot",
+          "phoenix_market_ws",
+          "flash_onchain_borrow_rate_state",
+          "fallback_constant"
+        ]
+      },
+      "RegisterPhoenixRequest": {
+        "type": "object",
+        "required": [
+          "wallet"
+        ],
+        "properties": {
+          "profileIndex": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Sub-account index (0..5) being activated. Each profile activates\nindependently — bots farming across multiple subaccounts must register\neach one before placing Phoenix orders from it.",
+            "minimum": 0
+          },
+          "wallet": {
+            "type": "string",
+            "description": "Owner wallet base58 pubkey. The activation is keyed on the profile PDA\nderived from `wallet` + `profileIndex`."
+          }
+        }
+      },
+      "RegisterPhoenixResponse": {
+        "type": "object",
+        "required": [
+          "profilePda",
+          "activated",
+          "message"
+        ],
+        "properties": {
+          "activated": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "profilePda": {
+            "type": "string"
+          }
+        }
+      },
+      "RevokeResponse": {
+        "type": "object",
+        "required": [
+          "success"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          }
+        }
+      },
+      "RouteCandidate": {
+        "type": "object",
+        "required": [
+          "venue",
+          "expectedCostUsd",
+          "costBreakdown",
+          "maxLeverage"
+        ],
+        "properties": {
+          "costBreakdown": {
+            "$ref": "#/components/schemas/CostBreakdown"
+          },
+          "expectedCostUsd": {
+            "type": "number",
+            "format": "double"
+          },
+          "filteredReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxLeverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "venue": {
+            "$ref": "#/components/schemas/Venue"
+          }
+        }
+      },
+      "RouteResult": {
+        "type": "object",
+        "required": [
+          "venue",
+          "reason",
+          "maxLeverage",
+          "expectedCostUsd",
+          "costBreakdown",
+          "clamped",
+          "candidates"
+        ],
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RouteCandidate"
+            }
+          },
+          "clamped": {
+            "type": "boolean"
+          },
+          "clampedMaxLeverage": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "costBreakdown": {
+            "$ref": "#/components/schemas/CostBreakdown"
+          },
+          "expectedCostUsd": {
+            "type": "number",
+            "format": "double"
+          },
+          "marketsVersion": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Stable hash over the cross-venue market universe at request time. Two\nresponses with the same `marketsVersion` were computed against the same\nmarket list — partners poll this to detect drift in the supported set\nwithout re-snapshotting every venue. Set by the handler post-`compute_route`.",
+            "minimum": 0
+          },
+          "maxLeverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "venue": {
+            "$ref": "#/components/schemas/Venue"
+          }
+        }
+      },
+      "ServiceHealth": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "db": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "grpcStream": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lastProcessedSlot": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "rpc": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "Side": {
+        "type": "string",
+        "enum": [
+          "long",
+          "short"
+        ]
+      },
+      "SideRates": {
+        "type": "object",
+        "required": [
+          "long",
+          "short"
+        ],
+        "properties": {
+          "long": {
+            "type": "number",
+            "format": "double"
+          },
+          "short": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "StatsSummaryResponse": {
+        "type": "object",
+        "required": [
+          "volume24hUsd",
+          "volume7dUsd",
+          "volumeAllUsd",
+          "openInterestUsd",
+          "activeTraders24h",
+          "feeRevenue24hUsd",
+          "venues",
+          "asOf"
+        ],
+        "properties": {
+          "activeTraders24h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "asOf": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "feeRevenue24hUsd": {
+            "type": "string"
+          },
+          "openInterestUsd": {
+            "type": "string"
+          },
+          "venues": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VenueStats"
+            }
+          },
+          "volume24hUsd": {
+            "type": "string"
+          },
+          "volume7dUsd": {
+            "type": "string"
+          },
+          "volumeAllUsd": {
+            "type": "string"
+          }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "required": [
+          "db"
+        ],
+        "properties": {
+          "db": {
+            "type": "string"
+          },
+          "indexer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceHealth"
+              }
+            ]
+          },
+          "orderBot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceHealth"
+              }
+            ]
+          }
+        }
+      },
+      "SweepBalances": {
+        "type": "object",
+        "required": [
+          "SOL",
+          "BTC",
+          "ETH"
+        ],
+        "properties": {
+          "BTC": {
+            "type": "number",
+            "format": "double"
+          },
+          "ETH": {
+            "type": "number",
+            "format": "double"
+          },
+          "SOL": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "SyncSweepResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "message"
+        ],
+        "properties": {
+          "balances": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SweepBalances",
+                "description": "Pre-sweep snapshot of the profile's tokenized residue. Present whenever\nthe response had something to act on — useful for the bot to confirm\npost-close what was reclaimed. Token amounts are in their respective\nnative scales (SOL: lamports / 1e9, BTC: 1e8, ETH: 1e8)."
+              }
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`\"clean\"` — nothing to sweep (no token-form residue on the profile).\n`\"queued\"` — a sweep was already triggered recently; this call is a\nno-op until the lock expires (~10s).\n`\"swept\"` — the operator submitted sweep instructions to bring residual\nWSOL/WBTC/WETH back to the user wallet as USDC."
+          }
+        }
+      },
+      "TpSlOrderResponse": {
+        "type": "object",
+        "description": "Unified TP/SL order response - represents orders from both Jupiter native and Imperial passthrough",
+        "required": [
+          "source",
+          "orderType",
+          "triggerPriceUsd",
+          "sizeUsd"
+        ],
+        "properties": {
+          "closeBps": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Decrease-only close percentage in basis points (10000 = 100%). The\non-chain Order carries this so the program can apply it to live\nposition size at execution; surfacing it here lets the FE render the\nuser's chosen percentage without falling back to the\n`orderSizeUsd / positionSizeUsd` ratio (which drifts above 100% when\nthe parent limit fills slightly under-size). `None` for legacy rows\ncreated before the indexer started splatting `close_bps` into\n`passthrough_orders.order_data`.",
+            "minimum": 0
+          },
+          "currentBestPriceUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "currentIndicatorValue": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "dcaEndLeverageScaled": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dcaEndPriceUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dcaIntervalSeconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dcaLastLegTimestamp": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dcaLegsExecuted": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dcaLeverageWeightingType": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dcaNumLegs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dcaPriceLimitUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dcaStartLeverageScaled": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "dcaStartPriceUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dcaWeightingType": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "indicatorCondition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "indicatorRatchetSize": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "indicatorThreshold": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "indicatorTimeframe": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isActivated": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "isReverseFib": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "orderPda": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "orderType": {
+            "type": "string"
+          },
+          "profileIndex": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "ratchetSizeUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sizeUsd": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "triggerCondition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "triggerHitAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "triggerPriceUsd": {
+            "type": "string"
+          },
+          "worstPriceUsd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "UnifiedFundingRatesResponse": {
+        "type": "object",
+        "required": [
+          "rows"
+        ],
+        "properties": {
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnifiedFundingRow"
+            }
+          }
+        }
+      },
+      "UnifiedFundingRow": {
+        "type": "object",
+        "required": [
+          "symbol"
+        ],
+        "properties": {
+          "flash": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueFundingRate"
+              }
+            ]
+          },
+          "gmtrade": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueFundingRate"
+              }
+            ]
+          },
+          "jupiter": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueFundingRate"
+              }
+            ]
+          },
+          "phoenix": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueFundingRate"
+              }
+            ]
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "UnifiedMarkPriceRow": {
+        "type": "object",
+        "required": [
+          "symbol"
+        ],
+        "properties": {
+          "flash": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueMarkPrice"
+              }
+            ]
+          },
+          "gmtrade": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueMarkPrice"
+              }
+            ]
+          },
+          "jupiter": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueMarkPrice"
+              }
+            ]
+          },
+          "phoenix": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VenueMarkPrice"
+              }
+            ]
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "UnifiedMarkPricesResponse": {
+        "type": "object",
+        "required": [
+          "rows"
+        ],
+        "properties": {
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnifiedMarkPriceRow"
+            }
+          }
+        }
+      },
+      "Venue": {
+        "type": "string",
+        "enum": [
+          "jupiter",
+          "flash_trade",
+          "phoenix",
+          "gmtrade"
+        ]
+      },
+      "VenueCapability": {
+        "type": "object",
+        "required": [
+          "venue",
+          "asset",
+          "supported",
+          "maxLeverage",
+          "openFeeBps",
+          "closeFeeBps",
+          "mmr"
+        ],
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "borrowHourlyPct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Hourly borrow/funding cost as a percent of notional. JLP-style venues charge\nborrow on utilized liquidity; CLOBs run zero-sum funding and pass ~0."
+          },
+          "borrowHourlyPctBySide": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SideRates",
+                "description": "Side-specific override for `borrow_hourly_pct`. Required for GMTrade where long\nand short pay different combined funding+borrow rates. Negative entries mean the\nvenue pays the trader on that side; cost computation clamps to 0."
+              }
+            ]
+          },
+          "closeFeeBps": {
+            "type": "number",
+            "format": "double"
+          },
+          "maxLeverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "mmr": {
+            "type": "number",
+            "format": "double",
+            "description": "Maintenance margin ratio (fraction of notional). Liquidation triggers when\nresidual collateral falls below `mmr × notional`."
+          },
+          "openFeeBps": {
+            "type": "number",
+            "format": "double"
+          },
+          "supported": {
+            "type": "boolean"
+          },
+          "venue": {
+            "$ref": "#/components/schemas/Venue"
+          }
+        }
+      },
+      "VenueFundingRate": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "longBorrowRatePerHourPercent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Hourly borrow rate in percent. Always non-negative — the side holding\nthe position pays this regardless of funding direction. Set even when\nonly one side borrows (Jupiter longs pay borrow on the long custody;\nshorts on the short/USDC custody — both sides populated)."
+          },
+          "longFundingRatePerHourPercent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Hourly funding rate in percent (`0.04` = 0.04%). Sign convention is\nuniform across every venue this API serves: **positive long rate ⇒\nlongs pay shorts** (i.e. shorts receive); negative ⇒ shorts pay longs.\nGMTrade rates are passed through raw from the venue WS feed (which\nalready follows that convention); Phoenix exposes a single signed\nrate so the short-side value is the negation of the long-side. For\nJupiter and Flash this field is `None` — those venues charge borrow\nfees instead, see `*_borrow_rate_*`."
+          },
+          "shortBorrowRatePerHourPercent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "shortFundingRatePerHourPercent": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RateSource"
+          }
+        }
+      },
+      "VenueMarkPrice": {
+        "type": "object",
+        "required": [
+          "source",
+          "price",
+          "fetchedAtUnixMs"
+        ],
+        "properties": {
+          "fetchedAtUnixMs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Wall-clock time the underlying snapshot was last refreshed, in\nmilliseconds since epoch. For Phoenix this is the WS message timestamp;\nfor Flash it's the CustomOracle's `publish_time` (Pyth-pushed but\ntrails Hermes by however long Flash's keeper takes)."
+          },
+          "price": {
+            "type": "number",
+            "format": "double"
+          },
+          "source": {
+            "$ref": "#/components/schemas/PriceSource"
+          }
+        }
+      },
+      "VenueStats": {
+        "type": "object",
+        "required": [
+          "venue",
+          "volumeUsd",
+          "openInterestUsd",
+          "traderCount"
+        ],
+        "properties": {
+          "openInterestUsd": {
+            "type": "string"
+          },
+          "traderCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "venue": {
+            "type": "string"
+          },
+          "volumeUsd": {
+            "type": "string"
+          }
+        }
+      },
+      "VolumeBucket": {
+        "type": "object",
+        "required": [
+          "timestamp",
+          "totalUsd",
+          "jupiterUsd",
+          "flashUsd",
+          "phoenixUsd",
+          "gmtradeUsd",
+          "tradeCount"
+        ],
+        "properties": {
+          "flashUsd": {
+            "type": "string"
+          },
+          "gmtradeUsd": {
+            "type": "string"
+          },
+          "jupiterUsd": {
+            "type": "string"
+          },
+          "phoenixUsd": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "totalUsd": {
+            "type": "string"
+          },
+          "tradeCount": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "VolumeResponse": {
+        "type": "object",
+        "required": [
+          "period",
+          "grouping",
+          "rows"
+        ],
+        "properties": {
+          "grouping": {
+            "type": "string"
+          },
+          "period": {
+            "type": "string"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeBucket"
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer_jwt": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT issued via `/mobile/connect` + `/mobile/exchange`. The wallet claim in the JWT must match the `wallet` field in each trading request body."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "auth",
+      "description": "Connect a wallet, issue a JWT, revoke a JWT"
+    },
+    {
+      "name": "trading",
+      "description": "Submit, cancel, and update orders. JWT required."
+    },
+    {
+      "name": "reads",
+      "description": "Public read endpoints. No auth required."
+    },
+    {
+      "name": "system",
+      "description": "Health and status."
+    }
+  ]
+}

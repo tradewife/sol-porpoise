@@ -1,0 +1,32 @@
+[project]
+name = "imperial-agent"
+version = "0.1.0"
+description = "Live paper-trading alpha agent for Solana perpetual futures via Imperial API"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+dependencies = [
+    "requests>=2.32",
+    "pandas>=2.2",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["adapters", "engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+tb = "short"

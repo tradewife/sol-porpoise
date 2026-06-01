@@ -1609,3 +1609,647 @@ class TestSignalScoringIntegration:
         non_unknown = sum(1 for c in result.values() if c.label != "unknown")
         assert non_unknown >= 4, f"Only {non_unknown} non-unknown components: " + \
             ", ".join(f"{k}={v.label}" for k, v in result.items() if v.label != "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Helpers for playbook tests
+# ---------------------------------------------------------------------------
+
+
+def _make_unknown_component(name: str) -> "SignalComponent":
+    from engine.scoring import SignalComponent
+    return SignalComponent(name=name, value=0.0, confidence=0.0, label="unknown")
+
+
+def _make_active_component(name: str, value: float, label: str = "active") -> "SignalComponent":
+    from engine.scoring import SignalComponent
+    return SignalComponent(name=name, value=value, confidence=0.8, label=label)
+
+
+def _all_unknown_signals() -> dict:
+    from engine.scoring import COMPONENT_WEIGHTS
+    return {name: _make_unknown_component(name) for name in COMPONENT_WEIGHTS}
+
+
+def _default_playbook_args(
+    price: float = 100.0,
+    atr: float = 2.0,
+    best_bid: float = 99.99,
+    best_ask: float = 100.01,
+) -> dict:
+    """Default args for generate_playbooks with all-unknown signals."""
+    from engine.playbooks import generate_playbooks
+    return dict(
+        symbol="BTC",
+        price=price,
+        atr=atr,
+        signals=_all_unknown_signals(),
+        best_bid=best_bid,
+        best_ask=best_ask,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Playbook tests (VAL-PB-001 through VAL-PB-014)
+# ---------------------------------------------------------------------------
+
+
+class TestPlaybookBreakoutTrigger:
+    """VAL-PB-001: Breakout triggers when oi_delta active + price beyond key level."""
+
+    def test_breakout_present_with_active_oi_delta_and_session(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5, "oi_rising_price_rising")
+        signals["session_structure"] = _make_active_component("session_structure", 0.3, "above_vwap")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        breakout = [p for p in result if p.setup_type == "breakout"]
+        assert len(breakout) >= 1, f"No breakout found, got {[p.setup_type for p in result]}"
+        assert breakout[0].side.value == "long"
+
+    def test_breakout_short_with_bearish_oi_below_vwap(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", -0.5, "oi_rising_price_falling")
+        signals["session_structure"] = _make_active_component("session_structure", -0.3, "below_vwap")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        breakout = [p for p in result if p.setup_type == "breakout"]
+        assert len(breakout) >= 1
+        assert breakout[0].side.value == "short"
+
+    def test_no_breakout_when_oi_delta_unknown(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        # session_structure active but oi_delta unknown → momentum shouldn't create breakout
+        signals["session_structure"] = _make_active_component("session_structure", 0.3, "above_vwap")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        breakout = [p for p in result if p.setup_type == "breakout"]
+        assert len(breakout) == 0, f"Breakout should not trigger with unknown oi_delta"
+
+
+class TestPlaybookFadeTrigger:
+    """VAL-PB-002: Fade triggers when funding_stretch > 1.5 stdev, contrarian side."""
+
+    def test_fade_present_at_high_stretch(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        # value > 0.5 → stretched → contrarian LONG (bullish signal, value positive)
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", 0.7, "contrarian_bullish"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        fade = [p for p in result if p.setup_type == "fade"]
+        assert len(fade) >= 1, f"No fade found, got {[p.setup_type for p in result]}"
+        # Contrarian bullish value → LONG
+        assert fade[0].side.value == "long"
+
+    def test_fade_short_with_negative_stretch(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", -0.7, "contrarian_bearish"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        fade = [p for p in result if p.setup_type == "fade"]
+        assert len(fade) >= 1
+        assert fade[0].side.value == "short"
+
+    def test_no_fade_below_threshold(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        # value = 0.3, below 0.5 threshold
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", 0.3, "contrarian_bullish"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        fade = [p for p in result if p.setup_type == "fade"]
+        assert len(fade) == 0
+
+    def test_no_fade_when_unknown(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        fade = [p for p in result if p.setup_type == "fade"]
+        assert len(fade) == 0
+
+
+class TestPlaybookVwapReclaimTrigger:
+    """VAL-PB-003: VWAP reclaim triggers with session_structure active."""
+
+    def test_vwap_reclaim_present_with_session_structure(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["session_structure"] = _make_active_component(
+            "session_structure", -0.3, "below_vwap"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        vwap = [p for p in result if p.setup_type == "vwap_reclaim"]
+        assert len(vwap) >= 1
+        # Price below VWAP → LONG (expect reclaim up)
+        assert vwap[0].side.value == "long"
+
+    def test_vwap_reclaim_short_above_vwap(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["session_structure"] = _make_active_component(
+            "session_structure", 0.3, "above_vwap"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        vwap = [p for p in result if p.setup_type == "vwap_reclaim"]
+        assert len(vwap) >= 1
+        assert vwap[0].side.value == "short"
+
+    def test_no_vwap_reclaim_when_unknown(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        vwap = [p for p in result if p.setup_type == "vwap_reclaim"]
+        assert len(vwap) == 0
+
+
+class TestPlaybookFundingFadeTrigger:
+    """VAL-PB-004: Funding fade requires both funding_stretch AND oi_delta."""
+
+    def test_funding_fade_with_both_active(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", 0.6, "contrarian_bullish"
+        )
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.3, "oi_rising")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        ff = [p for p in result if p.setup_type == "funding_fade"]
+        assert len(ff) >= 1
+
+    def test_no_funding_fade_with_only_funding(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", 0.6, "contrarian_bullish"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        ff = [p for p in result if p.setup_type == "funding_fade"]
+        assert len(ff) == 0
+
+    def test_no_funding_fade_with_only_oi(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.3, "oi_rising")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        ff = [p for p in result if p.setup_type == "funding_fade"]
+        assert len(ff) == 0
+
+    def test_no_funding_fade_when_both_unknown(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        ff = [p for p in result if p.setup_type == "funding_fade"]
+        assert len(ff) == 0
+
+
+class TestPlaybookMomentumTrigger:
+    """VAL-PB-005: Momentum continuation requires oi_delta aligned with trend."""
+
+    def test_momentum_present_with_oi_bullish(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5, "oi_rising_price_rising")
+        # No session_structure → momentum, not breakout
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        momentum = [p for p in result if p.setup_type == "momentum_continuation"]
+        assert len(momentum) >= 1
+        assert momentum[0].side.value == "long"
+
+    def test_momentum_short_with_bearish_oi(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", -0.5, "oi_rising_price_falling")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        momentum = [p for p in result if p.setup_type == "momentum_continuation"]
+        assert len(momentum) >= 1
+        assert momentum[0].side.value == "short"
+
+    def test_no_momentum_when_oi_unknown(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        momentum = [p for p in result if p.setup_type == "momentum_continuation"]
+        assert len(momentum) == 0
+
+
+class TestPlaybookLiquiditySweepTrigger:
+    """VAL-PB-006: Liquidity sweep triggers with active liquidity_magnet."""
+
+    def test_sweep_present_with_active_magnet(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["liquidity_magnet"] = _make_active_component(
+            "liquidity_magnet", -0.5, "ask_heavy"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        sweep = [p for p in result if p.setup_type == "liquidity_sweep"]
+        assert len(sweep) >= 1
+        # Ask-heavy (value < 0) → liquidity above → LONG sweep
+        assert sweep[0].side.value == "long"
+
+    def test_sweep_short_with_bid_heavy(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["liquidity_magnet"] = _make_active_component(
+            "liquidity_magnet", 0.5, "bid_heavy"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        sweep = [p for p in result if p.setup_type == "liquidity_sweep"]
+        assert len(sweep) >= 1
+        assert sweep[0].side.value == "short"
+
+    def test_no_sweep_when_unknown(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        sweep = [p for p in result if p.setup_type == "liquidity_sweep"]
+        assert len(sweep) == 0
+
+
+class TestPlaybookNoPlaybooksWhenAllUnknown:
+    """VAL-PB-007: Empty list when all signals unknown."""
+
+    def test_empty_list_all_unknown(self) -> None:
+        from engine.playbooks import generate_playbooks
+        args = _default_playbook_args()
+        result = generate_playbooks(**args)
+        assert result == []
+
+    def test_empty_list_zero_atr(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        args["atr"] = 0.0
+        result = generate_playbooks(**args)
+        assert result == []
+
+
+class TestPlaybookMaxThree:
+    """VAL-PB-008: Maximum 3 playbooks per symbol."""
+
+    def test_max_three_with_many_active_signals(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        # Activate all signals that could trigger different setups
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5, "oi_rising_price_rising")
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", 0.7, "contrarian_bullish"
+        )
+        signals["session_structure"] = _make_active_component(
+            "session_structure", 0.3, "above_vwap"
+        )
+        signals["liquidity_magnet"] = _make_active_component(
+            "liquidity_magnet", -0.5, "ask_heavy"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        assert len(result) <= 3, f"Got {len(result)} playbooks, expected max 3"
+
+
+class TestPlaybookStructuralConstraints:
+    """VAL-PB-009: Stop >= min_stop, TP1 >= 2R, TP2 >= 3R, correct ordering."""
+
+    def test_stop_distance_at_least_min_stop(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.volatility import compute_min_stop
+        from engine.paper_orders import OrderSide
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        atr = 2.0
+        price = 100.0
+        args = _default_playbook_args(price=price, atr=atr)
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            min_stop = compute_min_stop(atr, pb.entry, pb.side)
+            stop_distance = abs(pb.entry - pb.stop)
+            min_distance = abs(pb.entry - min_stop)
+            assert stop_distance >= min_distance - 0.001, \
+                f"{pb.setup_type}: stop_distance {stop_distance} < min {min_distance}"
+
+    def test_tp1_at_least_2r(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            stop_distance = abs(pb.entry - pb.stop)
+            tp1_distance = abs(pb.tp1 - pb.entry)
+            r_ratio = tp1_distance / stop_distance if stop_distance > 0 else 0
+            assert r_ratio >= 2.0 - 0.001, \
+                f"{pb.setup_type}: TP1 R-ratio {r_ratio} < 2.0"
+
+    def test_tp2_at_least_3r(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            stop_distance = abs(pb.entry - pb.stop)
+            tp2_distance = abs(pb.tp2 - pb.entry)
+            r_ratio = tp2_distance / stop_distance if stop_distance > 0 else 0
+            assert r_ratio >= 3.0 - 0.001, \
+                f"{pb.setup_type}: TP2 R-ratio {r_ratio} < 3.0"
+
+    def test_long_ordering_stop_entry_tp(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.paper_orders import OrderSide
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            if pb.side == OrderSide.LONG:
+                assert pb.stop < pb.entry, f"LONG: stop {pb.stop} >= entry {pb.entry}"
+                assert pb.entry < pb.tp1, f"LONG: entry {pb.entry} >= tp1 {pb.tp1}"
+                assert pb.tp1 < pb.tp2, f"LONG: tp1 {pb.tp1} >= tp2 {pb.tp2}"
+
+    def test_short_ordering_tp_entry_stop(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.paper_orders import OrderSide
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", -0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            if pb.side == OrderSide.SHORT:
+                assert pb.tp2 < pb.tp1, f"SHORT: tp2 {pb.tp2} >= tp1 {pb.tp1}"
+                assert pb.tp1 < pb.entry, f"SHORT: tp1 {pb.tp1} >= entry {pb.entry}"
+                assert pb.entry < pb.stop, f"SHORT: entry {pb.entry} >= stop {pb.stop}"
+
+    def test_structural_constraints_at_various_atrs(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.paper_orders import OrderSide
+        from engine.volatility import compute_min_stop
+
+        for atr in [0.5, 1.0, 5.0, 50.0]:
+            for price in [10.0, 100.0, 100000.0]:
+                for val in [0.5, -0.5]:
+                    signals = _all_unknown_signals()
+                    signals["oi_delta"] = _make_active_component("oi_delta", val)
+                    args = _default_playbook_args(price=price, atr=atr,
+                                                   best_bid=price * 0.9999,
+                                                   best_ask=price * 1.0001)
+                    args["signals"] = signals
+                    result = generate_playbooks(**args)
+                    for pb in result:
+                        # Stop distance >= min_stop
+                        min_stop = compute_min_stop(atr, pb.entry, pb.side)
+                        assert abs(pb.entry - pb.stop) >= abs(pb.entry - min_stop) - 0.001
+                        # TP1 >= 2R, TP2 >= 3R
+                        sd = abs(pb.entry - pb.stop)
+                        assert abs(pb.tp1 - pb.entry) / sd >= 2.0 - 0.001
+                        assert abs(pb.tp2 - pb.entry) / sd >= 3.0 - 0.001
+
+
+class TestPlaybookPassiveEntry:
+    """VAL-PB-010: Entry is passively placeable against bid/ask."""
+
+    def test_long_entry_at_or_below_best_bid(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.paper_orders import OrderSide
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        best_bid = 99.99
+        best_ask = 100.01
+        args = _default_playbook_args(best_bid=best_bid, best_ask=best_ask)
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            if pb.side == OrderSide.LONG:
+                assert pb.entry <= best_bid, \
+                    f"LONG entry {pb.entry} > best_bid {best_bid}"
+
+    def test_short_entry_at_or_above_best_ask(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.paper_orders import OrderSide
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", -0.5)
+        best_bid = 99.99
+        best_ask = 100.01
+        args = _default_playbook_args(best_bid=best_bid, best_ask=best_ask)
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            if pb.side == OrderSide.SHORT:
+                assert pb.entry >= best_ask, \
+                    f"SHORT entry {pb.entry} < best_ask {best_ask}"
+
+
+class TestPlaybookSideFromSignal:
+    """VAL-PB-011: Side derived from signal direction, not arbitrary default."""
+
+    def test_breakout_long_with_positive_oi(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5, "oi_rising_price_rising")
+        signals["session_structure"] = _make_active_component("session_structure", 0.3, "above_vwap")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        breakout = [p for p in result if p.setup_type == "breakout"]
+        assert breakout[0].side.value == "long"
+
+    def test_breakout_short_with_negative_oi(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", -0.5, "oi_rising_price_falling")
+        signals["session_structure"] = _make_active_component("session_structure", -0.3, "below_vwap")
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        breakout = [p for p in result if p.setup_type == "breakout"]
+        assert breakout[0].side.value == "short"
+
+    def test_fade_side_contrarian_to_funding(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        # Positive value = contrarian bullish → LONG
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", 0.7, "contrarian_bullish"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        fade = [p for p in result if p.setup_type == "fade"]
+        assert len(fade) >= 1
+        assert fade[0].side.value == "long"
+
+    def test_fade_side_contrarian_negative_funding(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        # Negative value = contrarian bearish → SHORT
+        signals["funding_stretch"] = _make_active_component(
+            "funding_stretch", -0.7, "contrarian_bearish"
+        )
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        fade = [p for p in result if p.setup_type == "fade"]
+        assert len(fade) >= 1
+        assert fade[0].side.value == "short"
+
+
+class TestPlaybookMetadata:
+    """VAL-PB-012: Every playbook has valid metadata fields."""
+
+    def test_rationale_non_empty(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            assert len(pb.rationale) > 0, f"{pb.setup_type}: empty rationale"
+
+    def test_probability_band_valid(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            assert pb.probability_band in ("high", "medium", "low"), \
+                f"{pb.setup_type}: invalid band '{pb.probability_band}'"
+
+    def test_expected_r_r_at_least_2(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            assert pb.expected_r_r >= 2.0, \
+                f"{pb.setup_type}: expected_r_r {pb.expected_r_r} < 2.0"
+
+    def test_invalidation_beyond_stop(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.paper_orders import OrderSide
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            if pb.side == OrderSide.LONG:
+                assert pb.invalidation < pb.stop, \
+                    f"LONG: invalidation {pb.invalidation} >= stop {pb.stop}"
+            else:
+                assert pb.invalidation > pb.stop, \
+                    f"SHORT: invalidation {pb.invalidation} <= stop {pb.stop}"
+
+    def test_setup_type_in_defined_set(self) -> None:
+        from engine.playbooks import generate_playbooks, SETUP_TYPES
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args()
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        for pb in result:
+            assert pb.setup_type in SETUP_TYPES, \
+                f"Unknown setup_type: {pb.setup_type}"
+
+
+class TestPlaybookEdgeCases:
+    """VAL-PB-014: Zero ATR, missing bid/ask, pipeline integration."""
+
+    def test_zero_atr_no_crash(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args(atr=0.0)
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        assert isinstance(result, list)
+        assert len(result) == 0  # Can't compute stop with 0 ATR
+
+    def test_zero_bid_ask_no_crash(self) -> None:
+        from engine.playbooks import generate_playbooks
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        args = _default_playbook_args(best_bid=0.0, best_ask=0.0)
+        args["signals"] = signals
+        result = generate_playbooks(**args)
+        assert isinstance(result, list)
+        assert len(result) == 0
+
+    def test_playbook_consumable_by_risk_sizing(self) -> None:
+        from engine.playbooks import generate_playbooks
+        from engine.risk import compute_risk_sizing, RiskParams
+        from engine.paper_orders import OrderSide
+        signals = _all_unknown_signals()
+        signals["oi_delta"] = _make_active_component("oi_delta", 0.5)
+        price = 100.0
+        atr = 2.0
+        best_bid = price * 0.9999
+        best_ask = price * 1.0001
+        args = _default_playbook_args(price=price, atr=atr,
+                                       best_bid=best_bid, best_ask=best_ask)
+        args["signals"] = signals
+        playbooks = generate_playbooks(**args)
+        params = RiskParams()
+        for pb in playbooks:
+            sizing = compute_risk_sizing(
+                symbol="BTC", side=pb.side, entry=pb.entry, stop=pb.stop,
+                params=params, best_bid=best_bid, best_ask=best_ask,
+            )
+            # Should produce a valid result (might be invalid if leverage out of range)
+            assert isinstance(sizing.valid, bool)
+            assert isinstance(sizing.reject_reason, str)

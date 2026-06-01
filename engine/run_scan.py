@@ -160,18 +160,31 @@ def _run_live_paper() -> int:
     except Exception as e:
         print(f"[{run_id}]   WARNING: Funding rates failed: {e}")
 
-    # Step 2-6: Build evidence tables section
-    evidence_lines = ["### Funding and OI\n"]
-    for sym in universe[:8]:
-        sym_funding = funding_data.get(sym, {})
-        funding_val = next(iter(sym_funding.values()), None) if sym_funding else None
-        evidence_lines.append(
-            f"| {sym} | {funding_val or 'N/A'} | N/A | N/A |\n"
-        )
+    # Build Candle objects from mark-price DataPoints for ATR/VWAP signals
+    candles_by_symbol: dict[str, list] = {}
+    for dp in all_datapoints:
+        if "mark_price" in dp.metric and isinstance(dp.value, (int, float)) and dp.value > 0:
+            ts = dp.provenance.source_ts or dp.provenance.fetched_ts_aest or "2026-01-01T00:00:00Z"
+            sym = dp.symbol
+            candles_by_symbol.setdefault(sym, []).append(
+                vol_mod.Candle(
+                    open=dp.value, high=dp.value, low=dp.value,
+                    close=dp.value, timestamp=ts,
+                )
+            )
 
-    report.set_section("C", "".join(evidence_lines))
-    report.set_section("D", "On-chain flow data: not yet integrated (adapter pending).")
-    report.set_section("E", "Playbook cards: not yet generated (requires full scoring pipeline).")
+    # Compute ATR per symbol from candles (fallback to price-proxy estimate)
+    atr_by_symbol: dict[str, float] = {}
+    for sym, candle_list in candles_by_symbol.items():
+        if len(candle_list) >= 14:
+            try:
+                atr_by_symbol[sym] = vol_mod.compute_atr(candle_list)
+            except ValueError:
+                pass
+        if sym not in atr_by_symbol:
+            price_est = prices.get(sym, 0)
+            if price_est > 0:
+                atr_by_symbol[sym] = price_est * 0.015
 
     # Step 11: Microstructure - get current prices for passive entry checks
     prices: dict[str, float] = {}
@@ -187,21 +200,32 @@ def _run_live_paper() -> int:
     hl_datapoints: list[Any] = []
 
     candidates: list[dict[str, Any]] = []
+    all_playbooks: list[dict[str, Any]] = []
+    signal_summary: dict[str, dict[str, Any]] = {}
     for sym in universe[:8]:
         price = prices.get(sym)
         if not price or price <= 0:
             continue
 
         # Extract real signal components from available data
+        sym_candles = candles_by_symbol.get(sym)
         components = signals_mod.extract_signals(
             symbol=sym,
             datapoints=all_datapoints,
             whale_points=whale_datapoints,
             hl_points=hl_datapoints,
-            candles=None,  # No candle data yet in scan loop
+            candles=sym_candles,
         )
 
         score = scoring_mod.compute_signal_score(sym, components)
+
+        # Store signal summary for report
+        signal_summary[sym] = {
+            "score": score,
+            "components": components,
+            "atr": atr_by_symbol.get(sym, 0),
+            "price": price,
+        }
 
         # Skip if no directional data
         if score.weighted_score == 0 and len(score.unknown_components) == 9:
@@ -212,61 +236,183 @@ def _run_live_paper() -> int:
             attrs={"score": score.weighted_score, "confidence": score.overall_confidence},
             source_name="Internal", confidence=0.5,
         )
-        candidates.append({"symbol": sym, "score": score, "price": price})
+        candidates.append({"symbol": sym, "score": score, "price": price, "components": components})
 
-    # Final selection: pick top 2 by expected score
+    # Final selection: pick top candidates by expected score
     candidates.sort(key=lambda c: abs(c["score"].weighted_score), reverse=True)
     final_trades: list[dict[str, Any]] = []
+    import engine.playbooks as pb_mod
 
     for cand in candidates[:2]:
         sym = cand["symbol"]
         price = cand["price"]
         score = cand["score"]
+        components = cand["components"]
+        atr = atr_by_symbol.get(sym, price * 0.015)
 
-        # Determine side based on signal score direction
-        side = OrderSide.LONG if score.weighted_score >= 0 else OrderSide.SHORT
-
-        # Compute ATR-based stop distance using compute_min_stop
-        # Default ATR estimate: 1.5% of price as hourly ATR proxy
-        # (Real candle-based ATR will come from signal-extraction pipeline)
-        atr_estimate = price * 0.015
-        stop = vol_mod.compute_min_stop(atr_estimate, price, side)
-        stop_distance = abs(price - stop)
-        tp1 = price + (stop_distance * 2) if side == OrderSide.LONG else price - (stop_distance * 2)
-        tp2 = price + (stop_distance * 3) if side == OrderSide.LONG else price - (stop_distance * 3)
-
-        # Get bid/ask from data
+        # Get bid/ask from data (use slight offset from mid for passive placement)
         best_bid = price * 0.9999
         best_ask = price * 1.0001
 
+        # Generate playbooks from signals
+        playbooks = pb_mod.generate_playbooks(
+            symbol=sym, price=price, atr=atr,
+            signals=components,
+            best_bid=best_bid, best_ask=best_ask,
+        )
+
+        # Store playbooks for report
+        for pb in playbooks:
+            all_playbooks.append({
+                "symbol": sym, "setup_type": pb.setup_type,
+                "side": pb.side.value, "entry": pb.entry,
+                "stop": pb.stop, "tp1": pb.tp1, "tp2": pb.tp2,
+                "invalidation": pb.invalidation,
+                "expected_r_r": pb.expected_r_r,
+                "probability_band": pb.probability_band,
+                "rationale": pb.rationale,
+            })
+
+        # Process best playbook (highest quality) for paper order
+        if not playbooks:
+            # No playbook qualifies → skip with reason
+            risk_mod.write_skipped_trade(
+                csv_path=PROJECT_ROOT / "ledgers" / "skipped_trades.csv",
+                symbol=sym, side="none", reason="no_playbook_qualified",
+                entry=price, stop=0,
+            )
+            continue
+
+        best_pb = playbooks[0]
+
         sizing = risk_mod.compute_risk_sizing(
-            symbol=sym, side=side, entry=price, stop=stop,
+            symbol=sym, side=best_pb.side, entry=best_pb.entry, stop=best_pb.stop,
             params=risk_params, best_bid=best_bid, best_ask=best_ask,
         )
 
         if not sizing.valid:
             risk_mod.write_skipped_trade(
                 csv_path=PROJECT_ROOT / "ledgers" / "skipped_trades.csv",
-                symbol=sym, side=side.value, reason=sizing.reject_reason,
-                entry=price, stop=stop,
+                symbol=sym, side=best_pb.side.value, reason=sizing.reject_reason,
+                entry=best_pb.entry, stop=best_pb.stop,
             )
             continue
 
         order = sizing.to_paper_order(
-            setup="scan_candidate", tp1=tp1, tp2=tp2,
-            provenance_tags=f"run={run_id},score={score.weighted_score:.3f}",
+            setup=best_pb.setup_type, tp1=best_pb.tp1, tp2=best_pb.tp2,
+            provenance_tags=f"run={run_id},score={score.weighted_score:.3f},setup={best_pb.setup_type}",
         )
         tracker.write_order(order)
         kg.add(subject=sym, predicate="has_order", object_=run_id,
-               attrs={"side": side.value, "entry": price, "stop": stop},
+               attrs={"side": best_pb.side.value, "entry": best_pb.entry, "stop": best_pb.stop},
                source_name="Internal")
 
         final_trades.append({
-            "symbol": sym, "side": side.value, "setup": "scan_candidate",
-            "entry": price, "stop": stop, "tp1": tp1, "tp2": tp2,
+            "symbol": sym, "side": best_pb.side.value, "setup": best_pb.setup_type,
+            "entry": best_pb.entry, "stop": best_pb.stop, "tp1": best_pb.tp1, "tp2": best_pb.tp2,
             "qty": sizing.qty, "notional": sizing.notional, "leverage": sizing.leverage,
             "risk_usd": sizing.risk_usd,
+            "rationale": best_pb.rationale, "probability_band": best_pb.probability_band,
         })
+
+    # --- Populate Report Sections C, D, E with real data ---
+
+    # Section C: Funding / OI Evidence Table
+    evidence_lines = [
+        "### Funding and OI Evidence\n\n",
+        "| Symbol | Funding Rate | OI Delta | Basis | Session | ATR |\n",
+        "|--------|-------------|----------|-------|---------|-----|\n",
+    ]
+    for sym in universe[:8]:
+        ss = signal_summary.get(sym)
+        if ss:
+            comps = ss["components"]
+            fr = comps.get("funding_stretch")
+            oi = comps.get("oi_delta")
+            ba = comps.get("basis")
+            sess = comps.get("session_structure")
+            atr_val = ss.get("atr", 0)
+            fr_str = f"{fr.value:.3f} ({fr.label})" if fr and fr.label != "unknown" else "unknown"
+            oi_str = f"{oi.value:.3f} ({oi.label})" if oi and oi.label != "unknown" else "unknown"
+            ba_str = f"{ba.value:.3f}" if ba and ba.label != "unknown" else "unknown"
+            sess_str = f"{sess.value:.3f} ({sess.label})" if sess and sess.label != "unknown" else "unknown"
+            atr_str = f"{atr_val:.2f}" if atr_val > 0 else "proxy"
+            evidence_lines.append(
+                f"| {sym} | {fr_str} | {oi_str} | {ba_str} | {sess_str} | {atr_str} |\n"
+            )
+        else:
+            evidence_lines.append(f"| {sym} | unknown | unknown | unknown | unknown | unknown |\n")
+    report.set_section("C", "".join(evidence_lines))
+
+    # Section D: On-chain / Cross-venue Flow Data
+    flow_lines = ["### Cross-Venue and On-Chain Data\n\n"]
+    whale_comps = []
+    dex_comps = []
+    for sym in universe[:8]:
+        ss = signal_summary.get(sym)
+        if ss:
+            wh = ss["components"].get("whale_evidence")
+            dx = ss["components"].get("dex_perp_lag")
+            if wh and wh.label != "unknown":
+                whale_comps.append(f"{sym}: {wh.label} (value={wh.value:.3f}, conf={wh.confidence:.2f})")
+            if dx and dx.label != "unknown":
+                dex_comps.append(f"{sym}: {dx.label} (value={dx.value:.3f}, conf={dx.confidence:.2f})")
+
+    if whale_comps:
+        flow_lines.append("**Whale Evidence:**\n")
+        for w in whale_comps:
+            flow_lines.append(f"- {w}\n")
+    else:
+        flow_lines.append("**Whale Evidence:** No active whale signals detected in this scan.\n")
+
+    flow_lines.append("\n")
+    if dex_comps:
+        flow_lines.append("**DEX-Perp Lag:**\n")
+        for d in dex_comps:
+            flow_lines.append(f"- {d}\n")
+    else:
+        flow_lines.append("**DEX-Perp Lag:** No cross-venue timestamp divergence detected.\n")
+
+    flow_lines.append(f"\n*Data from {len(all_datapoints)} DataPoints across {len(set(dp.provenance.source_name for dp in all_datapoints))} sources.*\n")
+    report.set_section("D", "".join(flow_lines))
+
+    # Section E: Playbook Cards
+    if all_playbooks:
+        pb_lines = [f"### Playbook Cards ({len(all_playbooks)} generated)\n\n"]
+        for i, pb in enumerate(all_playbooks, 1):
+            pb_lines.append(
+                f"**{i}. {pb['symbol']} {pb['side'].upper()} — {pb['setup_type']}**\n"
+                f"- Entry: {pb['entry']:.2f} | Stop: {pb['stop']:.2f} | "
+                f"Invalidation: {pb['invalidation']:.2f}\n"
+                f"- TP1: {pb['tp1']:.2f} | TP2: {pb['tp2']:.2f} | "
+                f"Expected R:R = {pb['expected_r_r']:.1f}\n"
+                f"- Probability: {pb['probability_band']} | Rationale: {pb['rationale']}\n\n"
+            )
+        report.set_section("E", "".join(pb_lines))
+    else:
+        # Explain why no playbooks
+        no_pb_reasons = []
+        for sym in universe[:8]:
+            ss = signal_summary.get(sym)
+            if ss:
+                unknowns = ss["score"].unknown_components if "score" in ss else []
+                if len(unknowns) == 9:
+                    no_pb_reasons.append(f"{sym}: all signals unknown (no data fetched)")
+                else:
+                    active = [k for k, v in ss["components"].items() if v.label != "unknown"]
+                    no_pb_reasons.append(f"{sym}: {len(active)} active signals ({', '.join(active[:4])}) but no setup criteria met")
+        if no_pb_reasons:
+            report.set_section("E", (
+                "### Playbook Cards\n\n"
+                "No playbook setups met criteria this scan.\n\n"
+                "Per-symbol diagnostics:\n" +
+                "\n".join(f"- {r}" for r in no_pb_reasons)
+            ))
+        else:
+            report.set_section("E", (
+                "### Playbook Cards\n\n"
+                "No symbols were scored (universe empty or no price data)."
+            ))
 
     # Flush KG triples
     kg.flush()
@@ -283,15 +429,27 @@ def _run_live_paper() -> int:
         for t in final_trades:
             trade_lines.append(
                 f"**{t['symbol']} {t['side'].upper()}**\n"
-                f"- Setup: {t['setup']}\n"
+                f"- Setup: {t['setup']} ({t.get('probability_band', 'N/A')} confidence)\n"
                 f"- Entry: {t['entry']:.2f} | Stop: {t['stop']:.2f}\n"
                 f"- TP1: {t['tp1']:.2f} | TP2: {t['tp2']:.2f}\n"
                 f"- Qty: {t['qty']:.4f} | Notional: ${t['notional']:.2f}\n"
                 f"- Leverage: {t['leverage']:.1f}x | Risk: ${t['risk_usd']:.2f}\n"
+                f"- Rationale: {t.get('rationale', 'N/A')}\n"
             )
         report.set_section("F", "\n".join(trade_lines))
     else:
-        report.set_section("F", f"No paper trades generated. Status: `{status}`.")
+        # Provide specific no-trade reason
+        if not candidates:
+            no_trade_reason = "no candidates scored above threshold (all signals unknown)"
+        elif not all_playbooks:
+            no_trade_reason = "no playbook setups met signal criteria for any candidate"
+        else:
+            no_trade_reason = "all risk sizings were invalid (leverage or quantity constraints)"
+        report.set_section("F", (
+            f"No paper trades generated. Status: `{status}`.\n\n"
+            f"Reason: {no_trade_reason}.\n\n"
+            f"Candidates scored: {len(candidates)}, Playbooks generated: {len(all_playbooks)}."
+        ))
 
     # Section G: X Post Draft
     report.set_section("G", (
@@ -303,13 +461,16 @@ def _run_live_paper() -> int:
         "### Assumptions\n"
         "- Market data from Imperial API (public endpoints)\n"
         "- Stop distance: ATR-based (0.8×ATR floor via compute_min_stop)\n"
-        "- Signal extraction: 9 components via extract_signals() from engine/signals.py\n\n"
+        "- Signal extraction: 9 components via extract_signals() from engine/signals.py\n"
+        "- Candle data: built from mark-price DataPoints (flat OHLC candles)\n"
+        "- Playbook generation: 7 setup types via generate_playbooks() from engine/playbooks.py\n\n"
         "### Gaps\n"
-        "- Candle-based ATR computation pending in scan loop (using price-proxy estimate)\n"
         "- Catalyst signal hard-coded unknown (no news/event data source)\n"
         "- Whale intelligence not yet called in scan loop (adapter exists)\n"
         "- Dextrabot scraping requires live HTML access\n"
-        "- DEX-perp lag requires multi-venue timestamp comparison"
+        "- DEX-perp lag requires multi-venue timestamp comparison\n"
+        "- LVN rejection playbook not yet implemented (future)\n"
+        "- Candle data is flat (O=H=L=C=mark_price); real OHLC would improve ATR accuracy"
     ))
 
     # Section I: Citations
@@ -336,13 +497,14 @@ def _run_live_paper() -> int:
         "| Metric | Score |\n|--------|-------|\n"
         f"| Data completeness | {len(all_datapoints)} points fetched |\n"
         f"| Provenance quality | {len(sources_used)} sources |\n"
-        f"| Signal extraction | extract_signals() wired |\n"
+        f"| Signal extraction | extract_signals() with candle data |\n"
+        f"| Playbook generation | generate_playbooks() wired |\n"
         f"| Passive-entry correctness | {'validated' if final_trades else 'N/A'} |\n"
         f"| Risk sizing correctness | {'validated' if final_trades else 'N/A'} |\n"
         f"| Paper-execution evaluability | ready |\n"
         f"| Report usefulness | complete |\n"
-        f"| Top failure mode | Candle data not yet in scan loop |\n"
-        f"| Next improvement | Add candle collection to scan loop |"
+        f"| Playbooks generated | {len(all_playbooks)} |\n"
+        f"| Top failure mode | {'none' if final_trades else 'insufficient signal quality for setups'} |"
     ))
 
     # Write report

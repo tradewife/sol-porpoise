@@ -69,6 +69,7 @@ def _run_live_paper() -> int:
     import engine.risk as risk_mod
     import engine.cross_venue as cv_mod
     import engine.report as report_mod
+    import engine.volatility as vol_mod
     from engine.paper_orders import OrderSide
 
     # Step 0: Mission Init
@@ -218,11 +219,14 @@ def _run_live_paper() -> int:
         # Determine side based on score direction (placeholder)
         side = OrderSide.LONG if score.weighted_score >= 0 else OrderSide.SHORT
 
-        # Compute stop distance (1% placeholder - would use ATR in production)
-        stop_pct = 0.02
-        stop = price * (1 - stop_pct) if side == OrderSide.LONG else price * (1 + stop_pct)
-        tp1 = price * (1 + stop_pct * 2) if side == OrderSide.LONG else price * (1 - stop_pct * 2)
-        tp2 = price * (1 + stop_pct * 3) if side == OrderSide.LONG else price * (1 - stop_pct * 3)
+        # Compute ATR-based stop distance using compute_min_stop
+        # Default ATR estimate: 1.5% of price as hourly ATR proxy
+        # (Real candle-based ATR will come from signal-extraction pipeline)
+        atr_estimate = price * 0.015
+        stop = vol_mod.compute_min_stop(atr_estimate, price, side)
+        stop_distance = abs(price - stop)
+        tp1 = price + (stop_distance * 2) if side == OrderSide.LONG else price - (stop_distance * 2)
+        tp2 = price + (stop_distance * 3) if side == OrderSide.LONG else price - (stop_distance * 3)
 
         # Get bid/ask from data
         best_bid = price * 0.9999
@@ -291,10 +295,10 @@ def _run_live_paper() -> int:
     report.set_section("H", (
         "### Assumptions\n"
         "- Market data from Imperial API (public endpoints)\n"
-        "- Stop distance: 2% placeholder (ATR-based stops not yet computed)\n"
+        "- Stop distance: ATR-based (0.8×ATR floor via compute_min_stop)\n"
         "- Signal components: mostly unknown (full pipeline pending)\n\n"
         "### Gaps\n"
-        "- ATR/volatility computation not implemented\n"
+        "- Candle-based ATR computation pending (using price-proxy estimate)\n"
         "- Session structure analysis not implemented\n"
         "- Catalyst scan not implemented\n"
         "- Whale intelligence not yet integrated in scan\n"
@@ -330,7 +334,7 @@ def _run_live_paper() -> int:
         f"| Paper-execution evaluability | ready |\n"
         f"| Report usefulness | complete |\n"
         f"| Top failure mode | Most signal components unknown |\n"
-        f"| Next improvement | Integrate ATR/volatility computation |"
+        f"| Next improvement | Wire signal extraction pipeline |"
     ))
 
     # Write report

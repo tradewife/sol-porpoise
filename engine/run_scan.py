@@ -173,6 +173,12 @@ def _run_live_paper() -> int:
                 )
             )
 
+    # Step 11: Microstructure - get current prices for passive entry checks
+    prices: dict[str, float] = {}
+    for dp in all_datapoints:
+        if "mark_price" in dp.metric and dp.symbol not in prices:
+            prices[dp.symbol] = dp.value
+
     # Compute ATR per symbol from candles (fallback to price-proxy estimate)
     atr_by_symbol: dict[str, float] = {}
     for sym, candle_list in candles_by_symbol.items():
@@ -185,12 +191,6 @@ def _run_live_paper() -> int:
             price_est = prices.get(sym, 0)
             if price_est > 0:
                 atr_by_symbol[sym] = price_est * 0.015
-
-    # Step 11: Microstructure - get current prices for passive entry checks
-    prices: dict[str, float] = {}
-    for dp in all_datapoints:
-        if "mark_price" in dp.metric and dp.symbol not in prices:
-            prices[dp.symbol] = dp.value
 
     # Step 12-14: Scoring, Risk Sizing, Final Selection
     import engine.signals as signals_mod

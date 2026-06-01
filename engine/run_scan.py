@@ -180,19 +180,26 @@ def _run_live_paper() -> int:
             prices[dp.symbol] = dp.value
 
     # Step 12-14: Scoring, Risk Sizing, Final Selection
+    import engine.signals as signals_mod
+
+    # Collect whale and HL data (currently empty, adapters not called in scan loop)
+    whale_datapoints: list[Any] = []
+    hl_datapoints: list[Any] = []
+
     candidates: list[dict[str, Any]] = []
     for sym in universe[:8]:
         price = prices.get(sym)
         if not price or price <= 0:
             continue
 
-        # Build signal components from available data
-        components: dict[str, scoring_mod.SignalComponent] = {}
-        for comp_name in scoring_mod.COMPONENT_WEIGHTS:
-            # For now, most signals are unknown until full pipeline
-            components[comp_name] = scoring_mod.SignalComponent(
-                name=comp_name, value=0, confidence=0, label="unknown",
-            )
+        # Extract real signal components from available data
+        components = signals_mod.extract_signals(
+            symbol=sym,
+            datapoints=all_datapoints,
+            whale_points=whale_datapoints,
+            hl_points=hl_datapoints,
+            candles=None,  # No candle data yet in scan loop
+        )
 
         score = scoring_mod.compute_signal_score(sym, components)
 
@@ -216,7 +223,7 @@ def _run_live_paper() -> int:
         price = cand["price"]
         score = cand["score"]
 
-        # Determine side based on score direction (placeholder)
+        # Determine side based on signal score direction
         side = OrderSide.LONG if score.weighted_score >= 0 else OrderSide.SHORT
 
         # Compute ATR-based stop distance using compute_min_stop
@@ -296,13 +303,13 @@ def _run_live_paper() -> int:
         "### Assumptions\n"
         "- Market data from Imperial API (public endpoints)\n"
         "- Stop distance: ATR-based (0.8×ATR floor via compute_min_stop)\n"
-        "- Signal components: mostly unknown (full pipeline pending)\n\n"
+        "- Signal extraction: 9 components via extract_signals() from engine/signals.py\n\n"
         "### Gaps\n"
-        "- Candle-based ATR computation pending (using price-proxy estimate)\n"
-        "- Session structure analysis not implemented\n"
-        "- Catalyst scan not implemented\n"
-        "- Whale intelligence not yet integrated in scan\n"
-        "- Dextrabot scraping requires live HTML access"
+        "- Candle-based ATR computation pending in scan loop (using price-proxy estimate)\n"
+        "- Catalyst signal hard-coded unknown (no news/event data source)\n"
+        "- Whale intelligence not yet called in scan loop (adapter exists)\n"
+        "- Dextrabot scraping requires live HTML access\n"
+        "- DEX-perp lag requires multi-venue timestamp comparison"
     ))
 
     # Section I: Citations
@@ -329,12 +336,13 @@ def _run_live_paper() -> int:
         "| Metric | Score |\n|--------|-------|\n"
         f"| Data completeness | {len(all_datapoints)} points fetched |\n"
         f"| Provenance quality | {len(sources_used)} sources |\n"
+        f"| Signal extraction | extract_signals() wired |\n"
         f"| Passive-entry correctness | {'validated' if final_trades else 'N/A'} |\n"
         f"| Risk sizing correctness | {'validated' if final_trades else 'N/A'} |\n"
         f"| Paper-execution evaluability | ready |\n"
         f"| Report usefulness | complete |\n"
-        f"| Top failure mode | Most signal components unknown |\n"
-        f"| Next improvement | Wire signal extraction pipeline |"
+        f"| Top failure mode | Candle data not yet in scan loop |\n"
+        f"| Next improvement | Add candle collection to scan loop |"
     ))
 
     # Write report

@@ -1,0 +1,20 @@
+{
+  "mode": "live-paper-only",
+  "last_run_id": null,
+  "open_paper_orders": [],
+  "unresolved_outcomes": [],
+  "active_experiments": [],
+  "disabled_sources": [],
+  "promotion_status": {
+    "eligible": false,
+    "paper_candidates_evaluated": 0,
+    "days_of_scheduled_runs": 0,
+    "positive_expectancy": false,
+    "profit_factor_above_threshold": false,
+    "max_drawdown_within_policy": false,
+    "no_critical_failures_recent": false,
+    "passive_entry_checks_passed": false,
+    "reconciliation_implemented": false,
+    "human_approval": false
+  }
+}

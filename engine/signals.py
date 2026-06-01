@@ -400,12 +400,38 @@ def _extract_dex_perp_lag(
 def _extract_volatility(
     symbol: str,
     candles: list[Candle] | None = None,
+    precomputed_atr: float | None = None,
 ) -> SignalComponent:
     """Extract volatility from ATR and regime classification.
 
     Value represents volatility level; label includes regime.
-    Unknown without candle data.
+    Unknown without candle data or precomputed ATR.
     """
+    # If we have a precomputed ATR, use it directly
+    if precomputed_atr is not None and precomputed_atr > 0:
+        atr = precomputed_atr
+        # Derive price from candles if available, otherwise unknown
+        price = 0.0
+        if candles and len(candles) > 0:
+            price = candles[-1].close
+
+        if price <= 0:
+            return _unknown("volatility")
+
+        # Use ATR as avg_atr (classify as Normal regime)
+        regime = "Normal"
+        atr_pct = atr / price
+        value = _clamp(atr_pct * 25.0)
+        confidence = min(1.0, atr_pct * 50.0) if atr_pct > 0 else 0.3
+        label = f"regime_{regime}"
+
+        return SignalComponent(
+            name="volatility",
+            value=value,
+            confidence=confidence,
+            label=label,
+        )
+
     if candles is None or len(candles) < 14:
         return _unknown("volatility")
 
@@ -460,6 +486,7 @@ def extract_signals(
     whale_points: list[DataPoint],
     hl_points: list[DataPoint],
     candles: list[Candle] | None = None,
+    precomputed_atr: float | None = None,
 ) -> dict[str, SignalComponent]:
     """Extract all 9 signal components from data sources.
 
@@ -473,6 +500,7 @@ def extract_signals(
         whale_points: Whale/smart-money wallet data.
         hl_points: Hyperliquid data from Phantom MCP.
         candles: OHLC candle data for VWAP and volatility.
+        precomputed_atr: Pre-computed ATR value (used when candles insufficient).
 
     Returns:
         Dict mapping component names to SignalComponent instances.
@@ -516,7 +544,7 @@ def extract_signals(
         result["dex_perp_lag"] = _unknown("dex_perp_lag")
 
     try:
-        result["volatility"] = _extract_volatility(symbol, candles)
+        result["volatility"] = _extract_volatility(symbol, candles, precomputed_atr=precomputed_atr)
     except Exception:
         result["volatility"] = _unknown("volatility")
 

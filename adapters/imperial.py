@@ -136,7 +136,12 @@ class ImperialAdapter:
                 for venue_key in ("jupiter", "flash", "phoenix", "gmtrade"):
                     venue_data = row.get(venue_key)
                     if venue_data and isinstance(venue_data, dict):
-                        rate = venue_data.get("fundingRate")
+                        # Try multiple funding rate keys the API may use
+                        rate = (
+                            venue_data.get("fundingRate")
+                            or venue_data.get("longFundingRatePerHourPercent")
+                            or venue_data.get("fundingRatePerHour")
+                        )
                         if rate is not None:
                             points.append(DataPoint(
                                 symbol=symbol,
@@ -212,6 +217,46 @@ class ImperialAdapter:
             points.append(DataPoint(
                 symbol="SYSTEM", metric="api_status", value=status_val, provenance=prov,
             ))
+
+        elif endpoint == "gmtrade/funding-rates":
+            # gmtrade funding-rates returns a flat list, not {"rows": [...]}
+            items = data if isinstance(data, list) else data.get("rows", [])
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                symbol = normalize_symbol(item.get("symbol", "UNKNOWN"))
+                long_rate = item.get("longFundingRatePerHourPercent")
+                if long_rate is not None:
+                    points.append(DataPoint(
+                        symbol=symbol,
+                        metric="funding_rate_gmtrade",
+                        value=float(long_rate),
+                        provenance=prov,
+                        attrs={"source": "gmtrade_ws"},
+                    ))
+
+        elif endpoint == "phoenix/depth":
+            # phoenix/depth returns {"snapshots": {symbol: {mid, bids, asks, ...}}}
+            snapshots = data.get("snapshots", {})
+            for sym_key, snap in snapshots.items():
+                if not isinstance(snap, dict):
+                    continue
+                symbol = normalize_symbol(snap.get("symbol", sym_key))
+                mid = snap.get("mid")
+                if mid is not None:
+                    # Summarize bid/ask depth
+                    bids = snap.get("bids", [])
+                    asks = snap.get("asks", [])
+                    bid_depth = sum(float(b.get("sizeBase", 0)) for b in bids if isinstance(b, dict))
+                    ask_depth = sum(float(a.get("sizeBase", 0)) for a in asks if isinstance(a, dict))
+                    points.append(DataPoint(
+                        symbol=symbol, metric="depth_bid", value=bid_depth,
+                        provenance=prov, attrs={"side": "bid", "mid": float(mid)},
+                    ))
+                    points.append(DataPoint(
+                        symbol=symbol, metric="depth_ask", value=ask_depth,
+                        provenance=prov, attrs={"side": "ask", "mid": float(mid)},
+                    ))
 
         else:
             # Generic: try to extract rows

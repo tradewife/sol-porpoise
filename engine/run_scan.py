@@ -176,8 +176,26 @@ def _run_live_paper() -> int:
         for dp in funding_points:
             if "funding" in dp.metric:
                 funding_data.setdefault(dp.symbol, {})[dp.metric] = dp.value
+        print(f"[{run_id}]   Fetched {len(funding_points)} funding rate points")
     except Exception as e:
         print(f"[{run_id}]   WARNING: Funding rates failed: {e}")
+
+    # Fetch gmtrade funding rates (additional funding data source)
+    try:
+        gmfr_points = imperial.fetch_gmtrade_funding_rates()
+        all_datapoints.extend(gmfr_points)
+        print(f"[{run_id}]   Fetched {len(gmfr_points)} gmtrade funding rate points")
+    except Exception as e:
+        print(f"[{run_id}]   WARNING: GMTrade funding rates failed: {e}")
+
+    # Fetch phoenix depth data for core symbols (for liquidity_magnet signal)
+    try:
+        for sym in ["BTC", "ETH", "SOL"]:
+            depth_points = imperial.fetch_phoenix_depth(sym)
+            all_datapoints.extend(depth_points)
+        print(f"[{run_id}]   Fetched phoenix depth data for core symbols")
+    except Exception as e:
+        print(f"[{run_id}]   WARNING: Phoenix depth failed: {e}")
 
     # Build Candle objects from mark-price DataPoints for ATR/VWAP signals
     candles_by_symbol: dict[str, list] = {}
@@ -234,6 +252,7 @@ def _run_live_paper() -> int:
             whale_points=whale_datapoints,
             hl_points=hl_datapoints,
             candles=sym_candles,
+            precomputed_atr=atr_by_symbol.get(sym),
         )
 
         score = scoring_mod.compute_signal_score(sym, components)

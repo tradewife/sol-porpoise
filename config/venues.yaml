@@ -1,0 +1,110 @@
+# venues.yaml — Venue configuration for the Imperial live-paper trading agent.
+#
+# Defines the Imperial API endpoint and the four Solana perp venues
+# accessible through Imperial's routing system.  Hyperliquid is listed
+# as a data-only reference source (no execution).
+
+# ---------------------------------------------------------------------------
+# Imperial Trading API
+# ---------------------------------------------------------------------------
+imperial_api:
+  # Base URL for the Imperial public REST API.
+  # No authentication required for read-only endpoints.
+  base_url: "https://api.imperial.space"
+  # API version prefix for all endpoints.
+  api_version: "v1"
+  # Request timeout in seconds.
+  timeout_seconds: 30
+  # Maximum number of retries for transient failures.
+  max_retries: 3
+  # Key endpoints (for reference; adapter code constructs these):
+  #   GET /api/v1/funding-rates
+  #   GET /api/v1/mark-prices
+  #   GET /api/v1/stats/markets
+  #   GET /api/v1/stats/open-interest
+  #   GET /api/v1/stats/volume
+  #   GET /api/v1/stats/open-interest/history
+  #   GET /api/v1/phoenix/depth
+  #   GET /api/v1/route
+  #   GET /api/v1/status
+  #   GET /api/v1/gmtrade/liquidity
+  #   GET /api/v1/gmtrade/funding-rates
+
+# ---------------------------------------------------------------------------
+# Solana perp venues (accessible via Imperial routing)
+# ---------------------------------------------------------------------------
+# Each venue has a numeric code used by the Imperial API for routing.
+# The agent calls /route which returns per-venue cost breakdowns, then
+# selects the cheapest venue for each specific trade.
+venues:
+  jupiter:
+    code: 0
+    display_name: "Jupiter Perps"
+    description: "Jupiter Perpetual — largest Solana perp venue by volume"
+    chain: solana
+    executable: true
+  flash_trade:
+    code: 1
+    display_name: "Flash Trade"
+    description: "Flash Trade — Solana-native perps venue"
+    chain: solana
+    executable: true
+    mcp_available: true
+  phoenix:
+    code: 2
+    display_name: "Phoenix / Vulcan / Cinder"
+    description: "Phoenix order-book venue (includes Vulcan/Cinder labels)"
+    chain: solana
+    executable: true
+  gmtrade:
+    code: 3
+    display_name: "GM Trade"
+    description: "GM Trade — Solana perps venue"
+    chain: solana
+    executable: true
+
+# ---------------------------------------------------------------------------
+# Reference-only venues (data, no execution)
+# ---------------------------------------------------------------------------
+reference:
+  hyperliquid:
+    display_name: "Hyperliquid"
+    description: "USDC-margined perps DEX — used as cross-venue reference only"
+    chain: hyperliquid
+    executable: false
+    mcp_available: true
+    role: data_only_reference
+    # Hyperliquid provides: funding, prices, OI, positions, whale data
+    data_types:
+      - funding_rates
+      - mark_prices
+      - open_interest
+      - orderbook
+      - trades
+      - candles
+      - positions
+      - leaderboard
+  binance:
+    display_name: "Binance"
+    description: "CEX reference for cross-venue sanity checks"
+    chain: external
+    executable: false
+    role: data_only_reference
+  okx:
+    display_name: "OKX"
+    description: "CEX reference for cross-venue sanity checks"
+    chain: external
+    executable: false
+    role: data_only_reference
+  bybit:
+    display_name: "Bybit"
+    description: "CEX reference for cross-venue sanity checks"
+    chain: external
+    executable: false
+    role: data_only_reference
+  coinbase:
+    display_name: "Coinbase"
+    description: "CEX reference for cross-venue sanity checks"
+    chain: external
+    executable: false
+    role: data_only_reference

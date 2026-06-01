@@ -1,0 +1,178 @@
+# sources.yaml — Source tier definitions and fallback order for the
+# Imperial live-paper trading agent.
+#
+# Every data point must carry provenance: source_name, source_tier,
+# source_ts, fetched_ts_AEST, confidence_0to1.
+#
+# If a higher-tier source is unavailable, the agent records the failure
+# and falls back to the next source in the fallback_order list.
+
+# ---------------------------------------------------------------------------
+# Source tier definitions
+# ---------------------------------------------------------------------------
+# Tiers are ordered by trust/quality from highest to lowest.
+# The agent prefers higher-tier sources and degrades confidence when
+# falling back to lower tiers.
+tiers:
+  - name: On-chain
+    description: "Data derived directly from on-chain state (Solana RPC, Helius, etc.)"
+    confidence_base: 0.98
+    examples:
+      - "Solana RPC"
+      - "Helius"
+      - "Triton"
+
+  - name: HL-native
+    description: "Hyperliquid's own API — first-party data from the protocol itself"
+    confidence_base: 0.95
+    examples:
+      - "Hyperliquid Info API"
+      - "Hyperliquid WebSocket"
+
+  - name: Solana-native
+    description: "Solana-native venue APIs (Jupiter, Phoenix, Flash Trade, etc.)"
+    confidence_base: 0.93
+    examples:
+      - "Jupiter API"
+      - "Phoenix API"
+      - "Flash Trade MCP"
+
+  - name: Open
+    description: "Publicly accessible APIs and data sources with no authentication"
+    confidence_base: 0.90
+    examples:
+      - "Imperial API (public REST)"
+      - "Binance public API"
+      - "CoinGecko"
+
+  - name: Paid
+    description: "Paid data providers requiring authentication (requires human approval)"
+    confidence_base: 0.88
+    examples:
+      - "Arkham"
+      - "Nansen"
+      - "Glassnode"
+
+  - name: Proprietary
+    description: "Proprietary sources with restricted access (requires human approval)"
+    confidence_base: 0.85
+    examples:
+      - "Dextrabot (scraped)"
+      - "ApexLiquid"
+      - "SuperX"
+
+  - name: Derived
+    description: "Metrics computed from other sources. Must name raw inputs in provenance."
+    confidence_base: 0.75
+    examples:
+      - "Computed basis"
+      - "Aggregated VWAP"
+      - "Signal scores"
+
+  - name: Internal
+    description: "Agent-generated data (hypotheses, memory, internal state)"
+    confidence_base: 0.70
+    examples:
+      - "Mission state"
+      - "Durable lessons"
+      - "Paper trade history"
+
+# ---------------------------------------------------------------------------
+# Fallback order
+# ---------------------------------------------------------------------------
+# When fetching data for a given metric, the agent tries sources in this
+# order.  If the top source fails, it falls back to the next and records
+# the failure in source_health.csv.
+fallback_order:
+  # Market data (prices, orderbooks, trades)
+  - name: "Imperial API"
+    tier: Open
+    data_types:
+      - funding_rates
+      - mark_prices
+      - volume
+      - open_interest
+      - orderbook_depth
+      - route_costs
+
+  - name: "Hyperliquid API"
+    tier: HL-native
+    data_types:
+      - funding_rates
+      - mark_prices
+      - volume
+      - open_interest
+      - orderbook
+      - trades
+      - candles
+
+  - name: "Flash Trade MCP"
+    tier: Solana-native
+    data_types:
+      - market_overview
+      - trading_data
+      - leverage_info
+
+  - name: "Phantom MCP (Hyperliquid)"
+    tier: HL-native
+    data_types:
+      - perps_markets
+      - funding
+      - prices
+      - positions
+
+  # Cross-venue reference
+  - name: "Binance public API"
+    tier: Open
+    data_types:
+      - reference_prices
+      - cross_venue_sanity
+
+  - name: "OKX public API"
+    tier: Open
+    data_types:
+      - reference_prices
+      - cross_venue_sanity
+
+  # Whale / smart-money intelligence
+  - name: "Dextrabot"
+    tier: Proprietary
+    data_types:
+      - whale_wallets
+      - leaderboard
+      - per_wallet_pnl
+      - per_token_breakdown
+      - entity_classification
+
+  # DEX context
+  - name: "Jupiter"
+    tier: Solana-native
+    data_types:
+      - sol_spot_perp_context
+      - dex_routes
+
+  - name: "Raydium / Orca"
+    tier: Solana-native
+    data_types:
+      - dex_twaps
+      - spot_liquidity
+
+  # Aggregators (lowest priority for price data)
+  - name: "Coinglass"
+    tier: Open
+    data_types:
+      - aggregated_funding
+      - aggregated_oi
+    note: "Fallback only — mark clearly in provenance"
+
+# ---------------------------------------------------------------------------
+# Source health tracking
+# ---------------------------------------------------------------------------
+health:
+  # File path for source health CSV (relative to project root).
+  csv_path: "ledgers/source_health.csv"
+  # Minimum interval between successive health checks for the same source.
+  check_interval_seconds: 300
+  # A source is considered stale if its last successful fetch was longer
+  # ago than this threshold.
+  staleness_threshold_seconds: 3600

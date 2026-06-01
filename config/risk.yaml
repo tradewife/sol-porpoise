@@ -1,0 +1,93 @@
+# risk.yaml — Risk parameters for the Imperial live-paper trading agent.
+#
+# Controls account equity, maximum risk per trade, leverage range,
+# cancel/exit rules, and position sizing constraints.
+#
+# IMPORTANT: This file must not be modified by any automated agent code.
+# Changes to risk limits require explicit human approval.
+
+# ---------------------------------------------------------------------------
+# Account
+# ---------------------------------------------------------------------------
+# Reference equity in USDC for paper trading and risk sizing.
+equity: 100
+# Currency denomination.
+currency: USDC
+
+# ---------------------------------------------------------------------------
+# Per-trade risk budget
+# ---------------------------------------------------------------------------
+# Maximum fraction of equity risked on a single paper trade.
+# risk_usd = equity * max_risk_pct  →  100 * 0.20 = 20 USDC
+max_risk_pct: 0.20
+# Maximum dollar amount at risk per trade (computed, not configured).
+# max_risk_usd = equity * max_risk_pct = 20 USDC
+
+# ---------------------------------------------------------------------------
+# Leverage
+# ---------------------------------------------------------------------------
+leverage:
+  # Target leverage range.  The agent aims for positions within this band.
+  # If the risk-sized position would result in leverage below min, the trade
+  # is rejected (not enough capital efficiency for the setup).
+  min: 9
+  # Hard cap — no position may exceed this leverage, even if risk sizing
+  # would permit it.
+  max: 12
+
+# ---------------------------------------------------------------------------
+# Position sizing formula (for reference)
+# ---------------------------------------------------------------------------
+#   risk_usd           = equity * max_risk_pct
+#   stop_distance      = abs(entry - stop)
+#   qty_by_risk        = risk_usd / stop_distance
+#   qty_by_lev_cap     = (equity * leverage.max) / entry
+#   qty                = floor_to_lot_size(min(qty_by_risk, qty_by_lev_cap))
+#   notional           = qty * entry
+#   actual_leverage    = notional / equity
+#
+# Reject or resize if:
+#   - notional cannot fit 9x-12x without violating stop risk
+#   - quantity rounds below venue minimum
+#   - stop is inside noise (see volatility constraints)
+#   - entry cannot rest passively
+#   - liquidity is poor
+#   - catalyst risk is unacceptable
+#   - two final trades are too correlated
+
+# ---------------------------------------------------------------------------
+# Cancel / exit rules
+# ---------------------------------------------------------------------------
+cancel_rules:
+  # Minutes after paper order creation before it is automatically cancelled
+  # if still unfilled.
+  timeout_minutes: 90
+  # If the price drifts more than this fraction of the stop distance away
+  # from the entry price before the order fills, cancel the order.
+  # drift_threshold = 0.8 means cancel if price moves > 80% of stop distance.
+  drift_threshold: 0.8
+  # Hard exit time in Australia/Sydney timezone.
+  # All remaining open paper orders are force-cancelled at this time on the
+  # next calendar day after creation.
+  hard_exit_time: "22:00"
+  hard_exit_timezone: "Australia/Sydney"
+
+# ---------------------------------------------------------------------------
+# In-trade risk management
+# ---------------------------------------------------------------------------
+in_trade:
+  # If MAE (Maximum Adverse Excursion) exceeds this fraction of stop distance
+  # within the first 3 minutes after fill, consider aggressive exit
+  # (paper-only, labelled accordingly).
+  mae_early_exit_threshold: 0.6
+  mae_early_exit_window_minutes: 3
+
+# ---------------------------------------------------------------------------
+# Portfolio-level constraints
+# ---------------------------------------------------------------------------
+portfolio:
+  # Maximum concurrent open paper trades.
+  max_open_trades: 2
+  # Maximum portfolio risk — if two candidates are too correlated, one is
+  # skipped to avoid concentration.
+  correlation_check: true

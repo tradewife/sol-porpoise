@@ -2253,3 +2253,338 @@ class TestPlaybookEdgeCases:
             # Should produce a valid result (might be invalid if leverage out of range)
             assert isinstance(sizing.valid, bool)
             assert isinstance(sizing.reject_reason, str)
+
+
+# ---------------------------------------------------------------------------
+# Evaluate Outcomes tests (VAL-OUT-001 through VAL-OUT-011)
+# ---------------------------------------------------------------------------
+
+def _make_eval_order(**overrides) -> dict:
+    """Create a test order dict for evaluate-outcomes testing."""
+    defaults = {
+        "symbol": "SOL",
+        "side": "long",
+        "entry": 150.0,
+        "stop": 145.0,
+        "tp1": 160.0,
+        "tp2": 170.0,
+        "setup": "breakout",
+        "created_ts_aest": "2026-06-01 08:00:00 Australia/Sydney",
+        "fees_bps": 5.0,
+        "slippage_bps": 3.0,
+        "provenance_tags": "test",
+        "signals": ["funding_stretch", "oi_delta"],
+    }
+    defaults.update(overrides)
+    return defaults
+
+
+def _setup_eval_env(tmp_path: Path, orders: list[dict] | None = None) -> Path:
+    """Create temp directory structure for evaluate-outcomes testing."""
+    (tmp_path / "memory").mkdir(exist_ok=True)
+    (tmp_path / "ledgers").mkdir(exist_ok=True)
+    state = {
+        "mode": "live-paper-only",
+        "open_paper_orders": orders or [],
+    }
+    (tmp_path / "memory" / "mission_state.json").write_text(
+        json.dumps(state, indent=2) + "\n"
+    )
+    return tmp_path
+
+
+class TestEvaluateOutcomes:
+    """Tests for --mode evaluate-outcomes (VAL-OUT-001 through VAL-OUT-011)."""
+
+    def test_cli_mode_accepted_val_out_001(self) -> None:
+        """VAL-OUT-001: argparse accepts evaluate-outcomes and routes to handler."""
+        source = Path("engine/run_scan.py").read_text()
+        # Verify argparse choices include evaluate-outcomes
+        assert "evaluate-outcomes" in source
+        # Verify handler function exists
+        assert "_run_evaluate_outcomes" in source
+        # Verify dispatch in main()
+        assert "evaluate-outcomes" in source
+
+    def test_reads_orders_and_evaluates_fill_val_out_002(self, tmp_path: Path) -> None:
+        """VAL-OUT-002: Reads open orders, fetches candle data, evaluates fill."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        # LONG at 150, TP at 160, current price 161 → fills + TP hit
+        order = _make_eval_order(entry=150.0, stop=145.0, tp1=160.0)
+        base = _setup_eval_env(tmp_path, [order])
+
+        with patch("engine.run_scan._fetch_mark_prices", return_value={"SOL": 161.0}):
+            result = _run_evaluate_outcomes(base_path=base)
+
+        assert result == 0
+        # Verify outcomes.csv was written
+        outcomes_path = base / "ledgers" / "outcomes.csv"
+        assert outcomes_path.exists()
+        content = outcomes_path.read_text()
+        assert "SOL" in content
+
+    def test_outcome_computation_with_fees_val_out_003(self, tmp_path: Path) -> None:
+        """VAL-OUT-003: R, MAE, MFE computed with fees/slippage deduction."""
+        from engine.outcomes import OutcomeEvaluator
+        from engine.paper_orders import OrderSide, PaperOrder
+
+        order = PaperOrder(
+            symbol="SOL", setup="test", side=OrderSide.LONG,
+            entry=150, stop=145, tp1=160, tp2=170,
+            fees_bps=5.0, slippage_bps=3.0,
+        )
+        evaluator = OutcomeEvaluator(
+            outcomes_path=tmp_path / "outcomes.csv",
+            signal_outcomes_path=tmp_path / "signal_outcomes.csv",
+        )
+        # LONG win: exit at TP (160), stop_distance=5, raw R = (160-150)/5 = 2.0
+        # cost_r = (5+3)/10000 = 0.0008, result_r ≈ 1.9992
+        outcome = evaluator.compute_outcome(
+            order, exit_price=160.0,
+            mae_price=148.0, mfe_price=162.0,
+            fees_bps=5.0, slippage_bps=3.0,
+        )
+        assert outcome.result_r > 0
+        assert outcome.result_r < 2.0  # fees deducted
+        assert outcome.max_fve > 0  # MFE positive
+        assert outcome.max_ade > 0  # MAE positive
+
+        # Same-candle ambiguity: conservative stop exit
+        outcome_loss = evaluator.compute_outcome(
+            order, exit_price=145.0,
+            fees_bps=5.0, slippage_bps=3.0,
+        )
+        assert outcome_loss.result_r < 0  # loss
+
+    def test_outcomes_csv_schema_val_out_004(self, tmp_path: Path) -> None:
+        """VAL-OUT-004: Outcomes written to outcomes.csv with correct schema."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        order = _make_eval_order(entry=150.0, stop=145.0, tp1=160.0)
+        base = _setup_eval_env(tmp_path, [order])
+
+        with patch("engine.run_scan._fetch_mark_prices", return_value={"SOL": 161.0}):
+            _run_evaluate_outcomes(base_path=base)
+
+        outcomes_path = base / "ledgers" / "outcomes.csv"
+        assert outcomes_path.exists()
+        content = outcomes_path.read_text()
+        lines = content.strip().split("\n")
+        assert len(lines) >= 2  # header + at least 1 data row
+        header = lines[0]
+        # Verify schema columns
+        assert "result_R" in header
+        assert "max_FvE" in header
+        assert "max_AdE" in header
+        assert "fees_bps" in header
+        assert "slippage_bps" in header
+        assert "symbol" in header
+        assert "side" in header
+
+    def test_cancel_rules_enforced_val_out_005(self, tmp_path: Path) -> None:
+        """VAL-OUT-005: Hard exit cancel rule triggers for old in-trade orders."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        # Order created 2 days ago → hard exit triggers (past 22:00 AEST next day)
+        old_ts = (datetime.now(AEST) - timedelta(days=2)).strftime(
+            "%Y-%m-%d %H:%M:%S Australia/Sydney"
+        )
+        order = _make_eval_order(
+            entry=150.0, stop=145.0, tp1=160.0,
+            created_ts_aest=old_ts,
+        )
+        base = _setup_eval_env(tmp_path, [order])
+
+        # Price near entry: fills (candle covers entry to current),
+        # stays in_trade (no TP/stop hit), then hard exit cancels it
+        with patch("engine.run_scan._fetch_mark_prices", return_value={"SOL": 152.0}):
+            _run_evaluate_outcomes(base_path=base)
+
+        outcomes_path = base / "ledgers" / "outcomes.csv"
+        assert outcomes_path.exists()
+        content = outcomes_path.read_text()
+        assert "hard_exit" in content
+
+    def test_mission_state_updated_preserves_in_trade_val_out_006(self, tmp_path: Path) -> None:
+        """VAL-OUT-006: Resolved orders removed, in-trade orders preserved."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        # Order 1: LONG at 150, TP at 160, price at 161 → fills + TP hit → closed
+        closed_order = _make_eval_order(
+            entry=150.0, stop=145.0, tp1=160.0, symbol="SOL",
+        )
+        # Order 2: LONG at 100, stop at 95, TP at 110, price at 105 → fills, in_trade
+        in_trade_order = _make_eval_order(
+            entry=100.0, stop=95.0, tp1=110.0, symbol="ETH",
+        )
+        base = _setup_eval_env(tmp_path, [closed_order, in_trade_order])
+
+        with patch("engine.run_scan._fetch_mark_prices",
+                    return_value={"SOL": 161.0, "ETH": 105.0}):
+            _run_evaluate_outcomes(base_path=base)
+
+        # Check mission state: only ETH should remain
+        state = json.loads((base / "memory" / "mission_state.json").read_text())
+        remaining = state["open_paper_orders"]
+        assert len(remaining) == 1
+        assert remaining[0]["symbol"] == "ETH"
+
+    def test_signal_attribution_and_stats_val_out_007(self, tmp_path: Path) -> None:
+        """VAL-OUT-007: Signal attribution written, stats computed."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        order = _make_eval_order(
+            entry=150.0, stop=145.0, tp1=160.0,
+            signals=["funding_stretch", "oi_delta"],
+        )
+        base = _setup_eval_env(tmp_path, [order])
+
+        with patch("engine.run_scan._fetch_mark_prices", return_value={"SOL": 161.0}):
+            _run_evaluate_outcomes(base_path=base)
+
+        signal_path = base / "ledgers" / "signal_outcomes.csv"
+        assert signal_path.exists()
+        content = signal_path.read_text()
+        assert "funding_stretch" in content
+        assert "oi_delta" in content
+
+    def test_graceful_empty_missing_state_val_out_008(self, tmp_path: Path) -> None:
+        """VAL-OUT-008: Graceful no-op when no orders or missing state."""
+        from engine.run_scan import _run_evaluate_outcomes
+
+        # Empty orders
+        base = _setup_eval_env(tmp_path, [])
+        result = _run_evaluate_outcomes(base_path=base)
+        assert result == 0
+
+        # Missing mission_state.json
+        base2 = tmp_path / "empty_env"
+        base2.mkdir()
+        (base2 / "memory").mkdir()
+        (base2 / "ledgers").mkdir()
+        result2 = _run_evaluate_outcomes(base_path=base2)
+        assert result2 == 0
+
+    def test_correct_exit_codes_val_out_009(self, tmp_path: Path) -> None:
+        """VAL-OUT-009: Returns 0 on success, non-zero on fatal error."""
+        from engine.run_scan import _run_evaluate_outcomes
+
+        # Success case: empty orders
+        base = _setup_eval_env(tmp_path, [])
+        assert _run_evaluate_outcomes(base_path=base) == 0
+
+        # Fatal error case: corrupt state
+        base2 = tmp_path / "corrupt"
+        base2.mkdir()
+        (base2 / "memory").mkdir()
+        (base2 / "ledgers").mkdir()
+        (base2 / "memory" / "mission_state.json").write_text("NOT VALID JSON{{{")
+        assert _run_evaluate_outcomes(base_path=base2) == 1
+
+    def test_shell_script_exists_executable_val_out_010(self) -> None:
+        """VAL-OUT-010: evaluate_outcomes.sh exists and is executable."""
+        script = Path("scripts/evaluate_outcomes.sh")
+        assert script.exists(), "evaluate_outcomes.sh must exist"
+        assert script.stat().st_mode & 0o111, "evaluate_outcomes.sh must be executable"
+        content = script.read_text()
+        assert "#!/bin/bash" in content
+        assert "evaluate-outcomes" in content
+
+    def test_refuses_pre_order_candle_data_val_out_011(self) -> None:
+        """VAL-OUT-011: Pre-order candle data rejected."""
+        from engine.paper_orders import OrderSide, PaperOrder, evaluate_fill
+
+        order = PaperOrder(
+            symbol="SOL", setup="test", side=OrderSide.LONG,
+            entry=150, stop=145, tp1=160, tp2=170,
+            created_ts_aest="2026-06-01 08:10:00 Australia/Sydney",
+        )
+        order_ts = datetime(2026, 6, 1, 8, 10, tzinfo=AEST)
+        # Candle timestamp BEFORE order creation
+        candle_ts = datetime(2026, 6, 1, 8, 5, tzinfo=AEST)
+        result = evaluate_fill(order, 161, 148, 150, 155, candle_ts, order_ts)
+        assert result["status"] == "invalid_for_stats"
+        assert result.get("filled") is not True  # no fill from stale data
+
+    def test_cancel_timeout_rule(self, tmp_path: Path) -> None:
+        """Timeout cancel rule triggers for pending orders older than 90 minutes."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        # Order created 2 hours ago
+        old_ts = (datetime.now(AEST) - timedelta(hours=2)).strftime(
+            "%Y-%m-%d %H:%M:%S Australia/Sydney"
+        )
+        order = _make_eval_order(
+            entry=150.0, stop=145.0, tp1=160.0,
+            created_ts_aest=old_ts,
+        )
+        base = _setup_eval_env(tmp_path, [order])
+
+        # Mock evaluate_fill to return not-filled so order stays PENDING
+        not_filled_result = {"filled": False}
+        with patch("engine.paper_orders.evaluate_fill", return_value=not_filled_result):
+            with patch("engine.run_scan._fetch_mark_prices", return_value={"SOL": 152.0}):
+                _run_evaluate_outcomes(base_path=base)
+
+        outcomes_path = base / "ledgers" / "outcomes.csv"
+        assert outcomes_path.exists()
+        content = outcomes_path.read_text()
+        assert "timeout_90min" in content
+
+    def test_cancel_drift_rule(self, tmp_path: Path) -> None:
+        """Cancel triggers when price drifts > 0.8 * stop_distance."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        recent_ts = (datetime.now(AEST) - timedelta(minutes=5)).strftime(
+            "%Y-%m-%d %H:%M:%S Australia/Sydney"
+        )
+        # LONG at 150, stop at 145, stop_distance = 5
+        # Price at 155: |155-150| = 5, 0.8*5 = 4 → drift triggered
+        order = _make_eval_order(
+            entry=150.0, stop=145.0, tp1=160.0,
+            created_ts_aest=recent_ts,
+        )
+        base = _setup_eval_env(tmp_path, [order])
+
+        # Mock evaluate_fill to return not-filled so order stays PENDING
+        not_filled_result = {"filled": False}
+        with patch("engine.paper_orders.evaluate_fill", return_value=not_filled_result):
+            with patch("engine.run_scan._fetch_mark_prices", return_value={"SOL": 156.0}):
+                _run_evaluate_outcomes(base_path=base)
+
+        outcomes_path = base / "ledgers" / "outcomes.csv"
+        assert outcomes_path.exists()
+        content = outcomes_path.read_text()
+        assert "price_drift" in content
+
+    def test_cancel_hard_exit_rule(self, tmp_path: Path) -> None:
+        """Cancel triggers on hard exit after 22:00 AEST next day."""
+        from engine.run_scan import _run_evaluate_outcomes
+        from unittest.mock import patch
+
+        # Order created 2 days ago (well past next-day 22:00 AEST)
+        old_ts = (datetime.now(AEST) - timedelta(days=2)).strftime(
+            "%Y-%m-%d %H:%M:%S Australia/Sydney"
+        )
+        order = _make_eval_order(
+            entry=150.0, stop=145.0, tp1=160.0,
+            created_ts_aest=old_ts,
+        )
+        base = _setup_eval_env(tmp_path, [order])
+
+        with patch("engine.run_scan._fetch_mark_prices", return_value={"SOL": 152.0}):
+            _run_evaluate_outcomes(base_path=base)
+
+        outcomes_path = base / "ledgers" / "outcomes.csv"
+        assert outcomes_path.exists()
+        content = outcomes_path.read_text()
+        # Hard exit should trigger
+        assert "hard_exit" in content

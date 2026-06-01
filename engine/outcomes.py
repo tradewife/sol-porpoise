@@ -117,7 +117,7 @@ class OutcomeEvaluator:
                 f.write(OUTCOMES_HEADER + "\n")
             f.write(outcome.to_csv_row() + "\n")
 
-    def write_signal_attribution(self, order_id: str, signals: list[str]) -> None:
+    def write_signal_attribution(self, order_id: str, signals: list[str], result_r: float | None = None) -> None:
         """Link signals to an order outcome for later hit-rate computation."""
         header_needed = (
             not self.signal_outcomes_path.exists()
@@ -126,8 +126,9 @@ class OutcomeEvaluator:
         with open(self.signal_outcomes_path, "a", encoding="utf-8", newline="") as f:
             if header_needed:
                 f.write("order_id,signal,result_r,timestamp_Australia/Sydney\n")
+            r_str = str(round(result_r, 4)) if result_r is not None else ""
             for signal in signals:
-                f.write(f"{order_id},{signal},,{aest_now_iso()}\n")
+                f.write(f"{order_id},{signal},{r_str},{aest_now_iso()}\n")
 
     def compute_signal_stats(self) -> dict[str, dict[str, Any]]:
         """Compute per-signal hit rate and average R from outcomes."""

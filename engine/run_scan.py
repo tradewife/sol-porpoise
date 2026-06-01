@@ -40,6 +40,25 @@ def _load_yaml_config(name: str) -> dict:
     return {}
 
 
+def _save_mission_state_to(path: Path, state: dict) -> None:
+    path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _fetch_mark_prices() -> dict[str, float]:
+    """Fetch current mark prices via Imperial adapter. Returns {symbol: price}."""
+    import adapters.imperial as imperial_mod
+    adapter = imperial_mod.ImperialAdapter()
+    price_map: dict[str, float] = {}
+    try:
+        mark_prices = adapter.fetch_mark_prices()
+        for dp in mark_prices:
+            if "mark_price" in dp.metric and isinstance(dp.value, (int, float)) and dp.value > 0:
+                price_map[dp.symbol] = dp.value
+    except Exception:
+        pass
+    return price_map
+
+
 def _run_plumbing_dry_run() -> int:
     from engine.report import build_dry_run_report
 
@@ -513,7 +532,23 @@ def _run_live_paper() -> int:
     # Update mission state
     state["last_run_id"] = run_id
     state["open_paper_orders"] = [
-        {"symbol": t["symbol"], "side": t["side"], "entry": t["entry"]}
+        {
+            "symbol": t["symbol"],
+            "side": t["side"],
+            "setup": t["setup"],
+            "entry": t["entry"],
+            "stop": t["stop"],
+            "tp1": t["tp1"],
+            "tp2": t["tp2"],
+            "qty": t["qty"],
+            "notional": t["notional"],
+            "leverage": t["leverage"],
+            "created_ts_aest": tracker.read_orders()[-1].created_ts_aest if tracker.read_orders() else aest_now_iso(),
+            "fees_bps": 5.0,
+            "slippage_bps": 3.0,
+            "provenance_tags": f"run={run_id}",
+            "signals": [k for k, v in candidates[0]["components"].items() if v.label != "unknown"][:5] if candidates else [],
+        }
         for t in final_trades
     ]
     _save_mission_state(state)
@@ -524,11 +559,207 @@ def _run_live_paper() -> int:
     return 0
 
 
+def _reconstruct_order(data: dict) -> "paper_orders.PaperOrder":
+    """Reconstruct a PaperOrder from a mission_state dict."""
+    import engine.paper_orders as po_mod
+    return po_mod.PaperOrder(
+        symbol=data["symbol"],
+        setup=data.get("setup", "unknown"),
+        side=po_mod.OrderSide(data["side"]),
+        entry=float(data["entry"]),
+        stop=float(data.get("stop", 0)),
+        tp1=float(data.get("tp1", 0)),
+        tp2=float(data.get("tp2", 0)),
+        qty=float(data.get("qty", 0)),
+        notional=float(data.get("notional", 0)),
+        leverage=float(data.get("leverage", 0)),
+        created_ts_aest=data.get("created_ts_aest", ""),
+        fees_bps=float(data.get("fees_bps", 5.0)),
+        slippage_bps=float(data.get("slippage_bps", 3.0)),
+        provenance_tags=data.get("provenance_tags", ""),
+    )
+
+
+def _run_evaluate_outcomes(base_path: Path | None = None) -> int:
+    """Evaluate open paper orders against post-order market data.
+
+    Reads open orders from mission_state.json, fetches current prices,
+    evaluates fills, computes outcomes, updates state.
+    """
+    import engine.paper_orders as po_mod
+    import engine.outcomes as outcomes_mod
+
+    root = base_path or PROJECT_ROOT
+    state_path = root / "memory" / "mission_state.json"
+
+    # Handle missing state file
+    if not state_path.exists():
+        print("[evaluate-outcomes] No mission_state.json found. Nothing to evaluate.")
+        return 0
+
+    # Load state
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[evaluate-outcomes] Corrupt mission_state.json: {e}", file=sys.stderr)
+        return 1
+
+    open_orders_data = state.get("open_paper_orders", [])
+    if not open_orders_data:
+        print("[evaluate-outcomes] No open paper orders. Nothing to evaluate.")
+        return 0
+
+    print(f"[evaluate-outcomes] Processing {len(open_orders_data)} open orders...")
+
+    # Initialize evaluator
+    evaluator = outcomes_mod.OutcomeEvaluator(
+        outcomes_path=root / "ledgers" / "outcomes.csv",
+        signal_outcomes_path=root / "ledgers" / "signal_outcomes.csv",
+    )
+
+    current_ts = datetime.now(AEST)
+    remaining_orders: list[dict] = []
+    resolved_count = 0
+
+    # Fetch current mark prices
+    price_map = _fetch_mark_prices()
+    if not price_map:
+        print("[evaluate-outcomes] WARNING: Could not fetch any mark prices.")
+
+    for order_data in open_orders_data:
+        # Reconstruct PaperOrder
+        try:
+            order = _reconstruct_order(order_data)
+        except (KeyError, ValueError) as e:
+            print(f"[evaluate-outcomes] Skipping malformed order: {e}")
+            remaining_orders.append(order_data)
+            continue
+
+        current_price = price_map.get(order.symbol)
+        if current_price is None or current_price <= 0:
+            print(f"[evaluate-outcomes] No price for {order.symbol}, keeping order.")
+            remaining_orders.append(order_data)
+            continue
+
+        # Parse order timestamp
+        order_ts = po_mod._parse_aest(order.created_ts_aest)
+        if not order_ts:
+            print(f"[evaluate-outcomes] No timestamp for {order.symbol}, keeping order.")
+            remaining_orders.append(order_data)
+            continue
+
+        # Build candle data from current price (post-order by definition)
+        # Construct candle spanning from entry to current price to detect fills
+        candle_ts = current_ts
+        candle_high = max(current_price, order.entry)
+        candle_low = min(current_price, order.entry)
+        candle_open = current_price
+        candle_close = current_price
+
+        # Evaluate fill against post-order candle data
+        fill_result = po_mod.evaluate_fill(
+            order,
+            candle_high=candle_high,
+            candle_low=candle_low,
+            candle_open=candle_open,
+            candle_close=candle_close,
+            candle_ts=candle_ts,
+            order_ts=order_ts,
+        )
+
+        # Handle: pre-order data rejected
+        if fill_result.get("status") == "invalid_for_stats":
+            print(f"[evaluate-outcomes] {order.symbol}: pre-order data rejected.")
+            remaining_orders.append(order_data)
+            continue
+
+        # Handle: filled and closed (stop or TP hit)
+        if fill_result.get("status") == "closed":
+            exit_price = fill_result.get("exit_price", current_price)
+            # MAE: worst price against position
+            mae_price = candle_low if order.side == po_mod.OrderSide.LONG else candle_high
+            # MFE: best price for position
+            mfe_price = candle_high if order.side == po_mod.OrderSide.LONG else candle_low
+
+            outcome = evaluator.compute_outcome(
+                order, exit_price=exit_price,
+                mae_price=mae_price, mfe_price=mfe_price,
+                fees_bps=order.fees_bps, slippage_bps=order.slippage_bps,
+            )
+            evaluator.write_outcome(outcome)
+
+            # Write signal attribution with result_r
+            signals = order_data.get("signals", [])
+            order_id = order_data.get("id", f"{order.symbol}_{order.created_ts_aest}")
+            if signals:
+                evaluator.write_signal_attribution(
+                    order_id, signals, result_r=outcome.result_r,
+                )
+
+            resolved_count += 1
+            print(f"[evaluate-outcomes] {order.symbol}: closed, R={outcome.result_r:.3f}")
+            continue
+
+        # Handle: filled but still in trade
+        if fill_result.get("status") == "in_trade":
+            should_cancel, reason = po_mod.check_cancel_rules(order, current_price, current_ts)
+            if should_cancel and reason:
+                order.filled = po_mod.OrderStatus.CANCELLED
+                cancel_outcome = evaluator.compute_outcome(
+                    order, exit_price=current_price,
+                    fees_bps=order.fees_bps, slippage_bps=order.slippage_bps,
+                )
+                cancel_outcome.notes = reason.value
+                evaluator.write_outcome(cancel_outcome)
+                resolved_count += 1
+                print(f"[evaluate-outcomes] {order.symbol}: cancelled ({reason.value})")
+            else:
+                remaining_orders.append(order_data)
+                print(f"[evaluate-outcomes] {order.symbol}: in_trade, keeping.")
+            continue
+
+        # Handle: not filled (pending)
+        if not fill_result.get("filled"):
+            should_cancel, reason = po_mod.check_cancel_rules(order, current_price, current_ts)
+            if should_cancel and reason:
+                order.filled = po_mod.OrderStatus.CANCELLED
+                cancel_outcome = evaluator.compute_outcome(
+                    order, exit_price=current_price,
+                    fees_bps=order.fees_bps, slippage_bps=order.slippage_bps,
+                )
+                cancel_outcome.notes = reason.value
+                evaluator.write_outcome(cancel_outcome)
+                resolved_count += 1
+                print(f"[evaluate-outcomes] {order.symbol}: cancelled ({reason.value})")
+            else:
+                remaining_orders.append(order_data)
+                print(f"[evaluate-outcomes] {order.symbol}: still pending, keeping.")
+            continue
+
+        # Default: keep in open orders
+        remaining_orders.append(order_data)
+
+    # Update mission state
+    state["open_paper_orders"] = remaining_orders
+    _save_mission_state_to(state_path, state)
+
+    # Compute signal stats
+    stats = evaluator.compute_signal_stats()
+    if stats:
+        print(f"[evaluate-outcomes] Signal stats: {len(stats)} signals tracked")
+
+    print(f"[evaluate-outcomes] Evaluated {len(open_orders_data)} orders")
+    print(f"[evaluate-outcomes] Resolved: {resolved_count}")
+    print(f"[evaluate-outcomes] Remaining: {len(remaining_orders)}")
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Imperial Agent Run Scan")
     parser.add_argument(
         "--mode",
-        choices=["plumbing-dry-run", "live-paper"],
+        choices=["plumbing-dry-run", "live-paper", "evaluate-outcomes"],
         default="plumbing-dry-run",
         help="Run mode",
     )
@@ -538,6 +769,8 @@ def main() -> int:
         return _run_plumbing_dry_run()
     elif args.mode == "live-paper":
         return _run_live_paper()
+    elif args.mode == "evaluate-outcomes":
+        return _run_evaluate_outcomes()
     else:
         print(f"Unknown mode: {args.mode}", file=sys.stderr)
         return 1

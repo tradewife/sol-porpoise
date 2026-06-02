@@ -1,0 +1,73 @@
+{
+  "mode": "live-paper-only",
+  "open_paper_orders": [
+    {
+      "symbol": "ZEC",
+      "side": "long",
+      "setup": "vwap_reclaim",
+      "entry": 616.65,
+      "stop": 609.1191510882541,
+      "tp1": 631.3160226736142,
+      "tp2": 638.7149798687342,
+      "qty": 19.464,
+      "notional": 11999.908459627592,
+      "leverage": 11.999908459627592,
+      "created_ts_aest": "2026-06-03 04:02:21 Australia/Sydney",
+      "fees_bps": 5.0,
+      "slippage_bps": 3.0,
+      "provenance_tags": "run=run_20260603T040206_AEST",
+      "signals": [
+        "funding_stretch",
+        "liquidity_magnet",
+        "session_structure",
+        "volatility"
+      ]
+    },
+    {
+      "symbol": "BTC",
+      "side": "long",
+      "setup": "vwap_reclaim",
+      "entry": 67594.0,
+      "stop": 66647.0677544973,
+      "tp1": 69075.74923962931,
+      "tp2": 69885.30973467331,
+      "qty": 0.177,
+      "notional": 11939.82320016881,
+      "leverage": 11.93982320016881,
+      "created_ts_aest": "2026-06-03 04:02:21 Australia/Sydney",
+      "fees_bps": 5.0,
+      "slippage_bps": 3.0,
+      "provenance_tags": "run=run_20260603T040206_AEST",
+      "signals": [
+        "funding_stretch",
+        "liquidity_magnet",
+        "session_structure",
+        "volatility"
+      ]
+    },
+    {
+      "symbol": "HYPE",
+      "side": "long",
+      "setup": "vwap_reclaim",
+      "entry": 72.461,
+      "stop": 71.47610464215,
+      "tp1": 74.08076074814998,
+      "tp2": 74.94897945014998,
+      "qty": 165.873,
+      "notional": 11999.969946064191,
+      "leverage": 11.99996994606419,
+      "created_ts_aest": "2026-06-03 04:02:21 Australia/Sydney",
+      "fees_bps": 5.0,
+      "slippage_bps": 3.0,
+      "provenance_tags": "run=run_20260603T040206_AEST",
+      "signals": [
+        "funding_stretch",
+        "liquidity_magnet",
+        "session_structure",
+        "volatility"
+      ]
+    }
+  ],
+  "unresolved_outcomes": [],
+  "last_run_id": "run_20260603T040206_AEST"
+}

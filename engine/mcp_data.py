@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from adapters.base import DataPoint, Provenance, SourceTier
 from adapters.normalizer import aest_now_iso, make_provenance
+from adapters.twitter_news import TwitterResult, format_twitter_prompt_section
 
 AEST = ZoneInfo("Australia/Sydney")
 
@@ -204,6 +205,7 @@ def format_ai_prompt(
     active_skills: str = "",
     existing_positions: list[dict[str, Any]] | None = None,
     prior_signal_stats: list[dict[str, Any]] | None = None,
+    twitter_results: list[TwitterResult] | None = None,
 ) -> str:
     """Build the AI reasoning prompt from aggregated market data.
 
@@ -226,6 +228,10 @@ def format_ai_prompt(
 
     if active_skills:
         lines.extend([active_skills, ""])
+
+    # Twitter CT Intel — AI agent only
+    if twitter_results is not None:
+        lines.extend([format_twitter_prompt_section(twitter_results), ""])
 
     lines.extend([
         "## Account",

@@ -23,6 +23,9 @@ from zoneinfo import ZoneInfo
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 AEST = ZoneInfo("Australia/Sydney")
 
+# Max symbols to fetch Twitter CT intel for (AI scan loop only).
+MAX_TWITTER_SYMBOLS = 5
+
 
 def _account_root(account_id: str) -> Path:
     """Resolve the account root directory.
@@ -1433,6 +1436,20 @@ def _run_ai_paper(account_id: str = "ai") -> int:
         print(f"[{run_id}] WARNING: {e}")
     active_skills_text = skills_mod.format_skills_for_prompt(loaded_skills)
 
+    # Fetch Twitter CT intel for AI agent only (not deterministic)
+    twitter_results_list = None
+    try:
+        from adapters.twitter_news import TwitterNewsAdapter
+        _twitter = TwitterNewsAdapter()
+        _twitter_results_list: list = []
+        for sym in universe[:MAX_TWITTER_SYMBOLS]:
+            _twitter_results_list.append(_twitter.fetch_symbol(sym))
+        twitter_results_list = _twitter_results_list
+        _tw_avail = sum(1 for r in _twitter_results_list if r.available)
+        print(f"[{run_id}] Twitter CT: {_tw_avail}/{len(_twitter_results_list)} symbols")
+    except Exception as e:
+        print(f"[{run_id}] Twitter CT unavailable: {e}")
+
     prompt = mcp_mod.format_ai_prompt(
         market_data=rich_data,
         equity=risk_params.equity,
@@ -1442,6 +1459,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
         active_skills=active_skills_text,
         existing_positions=rich_data.account.positions if rich_data.account else [],
         prior_signal_stats=signal_stats,
+        twitter_results=twitter_results_list,
     )
 
     # Save prompt for Droid/Hermes to use
@@ -1471,6 +1489,11 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     }
     request_path.write_text(json.dumps(request_payload, indent=2) + "\n", encoding="utf-8")
     print(f"[{run_id}] AI request metadata saved to data/ai_request.json")
+
+    # Clear stale AI response from previous cycles so mismatched prompt_ids
+    # don't pollute this run.
+    if ai_response_path.exists():
+        ai_response_path.unlink()
 
     bridge_status = "not_configured"
     agent_file_cfg = ai_config.get("ai", {}).get("agent_file", {})

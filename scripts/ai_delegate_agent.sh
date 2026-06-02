@@ -55,7 +55,7 @@ RESPONSE_JSON=$(droid exec \
     --cwd "$(dirname "$0")/.." \
     -f "$PROMPT_PATH" \
     --append-system-prompt "$BRIDGE_INSTRUCTION" \
-    2>/dev/null || true)
+    2>&1 || true)
 
 # Validate we got something
 if [ -z "$RESPONSE_JSON" ]; then

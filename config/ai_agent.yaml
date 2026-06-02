@@ -79,6 +79,7 @@ skills:
     - risk-execution-rails
     - provenance-auditor
     - outcome-learning
+    - twitter-ct-intel
   max_chars_per_skill: 2500
   fail_on_missing_core_skill: true
 

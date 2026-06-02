@@ -6,7 +6,7 @@ Live-paper crypto trading agent for Solana perpetual futures. Two parallel paper
 
 **Mode: `live-paper-only`** -- no live trading, no signing, no fund movement.
 
-**581 tests pass.** A cron job fires every hour on the hour, running two independent paper trading accounts in parallel on Phoenix Perps:
+**595 tests pass.** A cron job fires every hour on the hour, running two independent paper trading accounts in parallel on Phoenix Perps:
 
 1. **Deterministic account** (`accounts/deterministic/`) -- 14-step scan loop with fixed signal weights, 9 signal extractors, 7 playbook types. Executes paper trades via Vulcan on Phoenix.
 2. **AI account** (`accounts/ai/`) -- AI reasoning via repo-local skills + Droid/Hermes agent delegation (GLM-5.1). Builds enriched prompt, calls `droid exec`, validates prompt-bound response, executes via Vulcan. Falls closed to no-trade when no agent response.
@@ -43,6 +43,8 @@ Compare both accounts: `python -m engine.trial_dashboard --all`
 - **Flash Trade MCP** (`adapters/flash_trade.py`) -- Solana perps market data
 - **Phantom MCP** (`adapters/phantom.py`) -- Hyperliquid markets, funding, OI, positions
 - **Dextrabot** (`adapters/dextrabot.py`) -- whale intelligence scraper
+- **Kukapay News** (`adapters/kukapay.py`) -- crypto news sentiment for catalyst signal (deterministic only)
+- **Twitter CT Intel** (`adapters/twitter_news.py`) -- twitter-cli search for CT sentiment (AI agent only)
 
 ### Config (`config/`)
 - `run.yaml` -- mode, hourly schedule, 1000 USDC equity, max 4 concurrent, max 3 candidates
@@ -72,6 +74,7 @@ Expandable prompt modules controlled by `config/ai_agent.yaml`. Add new skills a
 - `risk-execution-rails` -- Hard constraints: equity, risk %, leverage, R:R minimums
 - `provenance-auditor` -- Evidence tags, risk_notes, data_gaps per trade
 - `outcome-learning` -- Informational prior outcomes, never adjust weights or sizing
+- `twitter-ct-intel` -- CT sentiment as soft context (AI agent only, never scored)
 
 ### Scripts (`scripts/`)
 - `cron_hourly.sh` -- Hourly cron entry point for both accounts
@@ -79,7 +82,7 @@ Expandable prompt modules controlled by `config/ai_agent.yaml`. Add new skills a
 - `run_scan.sh`, `trial_start.sh`, `trial_stop.sh` -- CLI wrappers
 
 ### Tests
-581 tests covering all validation contracts, engine modules, cross-module pipelines, account isolation, AI parsing, MCP data, skills loading, and end-to-end trial cycles.
+595 tests covering all validation contracts, engine modules, cross-module pipelines, account isolation, AI parsing, MCP data, skills loading, Twitter adapter, and end-to-end trial cycles.
 
 ## Quick Commands
 
@@ -117,11 +120,12 @@ vulcan paper status -o json
 - Python 3.13+
 - [Vulcan CLI](https://github.com/Ellipsis-Labs/vulcan-cli) (for Phoenix paper trading)
 - [Droid](https://factory.ai) (for AI account -- `droid exec` with GLM-5.1)
+- [twitter-cli](https://github.com/public-clis/twitter-cli) (for AI agent CT intel -- optional, degrades gracefully)
 - Solana RPC access (public mainnet RPC by default)
 
 ## What's Not Yet Done
 
-- **Catalyst signal** -- returns `unknown` with confidence 0 (5% weight)
+- **Catalyst signal (deterministic)** -- Kukapay returns `unknown` when unreachable (5% weight, degrades gracefully)
 - **Whale intelligence in production** -- Dextrabot scraping needs live HTML verification
 - **Promotion gates** -- 0/8 passed; requires accumulated paper-trade history
 - **Live trading** -- blocked on promotion gates and explicit human approval

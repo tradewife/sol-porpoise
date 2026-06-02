@@ -606,8 +606,34 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
     # Step 12-14: Scoring, Risk Sizing, Final Selection
     import engine.signals as signals_mod
 
-    # Collect whale and HL data (currently empty, adapters not called in scan loop)
+    # Collect whale data from Dextrabot (if available)
     whale_datapoints: list[Any] = []
+    try:
+        dext = dext_mod.DextrabotAdapter(cache_dir=str(PROJECT_ROOT / "data" / "raw"))
+        whale_datapoints = dext.fetch_wallets()
+        if whale_datapoints:
+            print(f"[{run_id}] Dextrabot: {len(whale_datapoints)} whale datapoints")
+    except Exception as e:
+        print(f"[{run_id}] Dextrabot unavailable: {e}")
+
+    # Collect catalyst news via Kukapay (if available)
+    catalyst_datapoints: list[Any] = []
+    try:
+        from adapters.kukapay import KukapayNewsAdapter
+        news_adapter = KukapayNewsAdapter()
+        for sym in universe[:5]:
+            try:
+                news = news_adapter.get_latest_news(days=1, limit=5, keyword=sym)
+                catalyst_datapoints.extend(news_adapter.to_datapoints(sym, news))
+            except Exception:
+                pass
+        if catalyst_datapoints:
+            print(f"[{run_id}] Kukapay: {len(catalyst_datapoints)} catalyst datapoints")
+    except Exception as e:
+        print(f"[{run_id}] Kukapay unavailable: {e}")
+
+    all_datapoints.extend(whale_datapoints)
+    all_datapoints.extend(catalyst_datapoints)
     hl_datapoints: list[Any] = []
 
     candidates: list[dict[str, Any]] = []

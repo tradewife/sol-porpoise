@@ -9,7 +9,7 @@ Extracts 9 signal components from market data:
 - whale_evidence: smart-money signals via integrate_whale_signals()
 - dex_perp_lag: timestamp lead/lag across venues
 - volatility: ATR and regime classification from volatility.py
-- catalyst: always unknown (future)
+- catalyst: news sentiment via Kukapay adapter (bearish/neutral/bullish)
 """
 
 from __future__ import annotations
@@ -548,7 +548,45 @@ def extract_signals(
     except Exception:
         result["volatility"] = _unknown("volatility")
 
-    # Catalyst: always unknown (future implementation)
-    result["catalyst"] = _unknown("catalyst")
+    # Catalyst: extract from news via Kukapay adapter if available
+    try:
+        result["catalyst"] = _extract_catalyst(symbol, datapoints)
+    except Exception:
+        result["catalyst"] = _unknown("catalyst")
 
     return result
+
+
+def _extract_catalyst(
+    symbol: str,
+    datapoints: list[DataPoint],
+) -> SignalComponent:
+    """Extract catalyst signal from news DataPoints or Kukapay adapter."""
+    # Check if catalyst news datapoints are already provided
+    catalyst_points = [dp for dp in datapoints if dp.metric == "catalyst_news" and dp.symbol == symbol]
+    if catalyst_points:
+        avg_sentiment = sum(dp.value for dp in catalyst_points) / len(catalyst_points)
+        confidence = min(0.8, len(catalyst_points) / 10.0)
+        if avg_sentiment > 0.3:
+            label = f"bullish_catalyst_{len(catalyst_points)}_articles"
+        elif avg_sentiment < -0.3:
+            label = f"bearish_catalyst_{len(catalyst_points)}_articles"
+        else:
+            label = f"neutral_catalyst_{len(catalyst_points)}_articles"
+        return SignalComponent(
+            name="catalyst", value=_clamp(avg_sentiment), confidence=confidence, label=label,
+        )
+
+    # Try Kukapay adapter directly
+    try:
+        from adapters.kukapay import KukapayNewsAdapter
+        adapter = KukapayNewsAdapter()
+        value, confidence, label = adapter.extract_catalyst_signal(symbol, days=1)
+        if confidence > 0:
+            return SignalComponent(
+                name="catalyst", value=_clamp(value), confidence=confidence, label=label,
+            )
+    except Exception:
+        pass
+
+    return _unknown("catalyst")

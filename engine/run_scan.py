@@ -188,6 +188,69 @@ def _format_signal_learning_section(stats: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _execute_trade_via_vulcan(
+    account_id: str,
+    symbol: str,
+    side: str,
+    notional_usdc: float,
+    tp: float | None = None,
+    sl: float | None = None,
+    run_id: str = "",
+) -> dict[str, Any] | None:
+    """Execute a paper trade via Vulcan (Phoenix Perps).
+
+    Returns a dict with fill and trigger details, or None on failure.
+    """
+    try:
+        from adapters.vulcan import VulcanAdapter
+        if not VulcanAdapter.is_available():
+            return None
+
+        v = VulcanAdapter(account_id=account_id, project_root=PROJECT_ROOT)
+
+        # Normalize symbol to what Phoenix supports
+        sym = symbol.upper().strip()
+
+        # Check if symbol exists on Phoenix
+        ticker = v.ticker(sym)
+        if not ticker or ticker.mark_price <= 0:
+            print(f"[{run_id}]   Vulcan: {sym} not available on Phoenix, skipping")
+            return None
+
+        # Check existing positions — don't duplicate same symbol
+        positions = v.positions()
+        for p in positions:
+            if p.symbol == sym:
+                print(f"[{run_id}]   Vulcan: {sym} already has open position, skipping")
+                return None
+
+        # Execute the trade
+        if side.lower() == "long":
+            fill = v.buy(sym, notional_usdc=notional_usdc)
+        else:
+            fill = v.sell(sym, notional_usdc=notional_usdc)
+
+        print(f"[{run_id}]   Vulcan fill: {fill.symbol} {fill.side} @ {fill.price:.2f} "
+              f"size={fill.size_tokens:.4f} fee={fill.fee:.4f}")
+
+        # Set TP/SL if provided
+        triggers = []
+        if tp is not None or sl is not None:
+            triggers = v.set_tpsl(sym, tp=tp, sl=sl)
+            for t in triggers:
+                print(f"[{run_id}]   Vulcan trigger: {t.kind} {t.symbol} @ {t.trigger_price:.2f}")
+
+        return {
+            "fill": fill,
+            "triggers": triggers,
+            "execution_venue": "vulcan-phoenix-paper",
+        }
+
+    except Exception as e:
+        print(f"[{run_id}]   Vulcan execution failed: {e}")
+        return None
+
+
 def _run_plumbing_dry_run(account_id: str = "deterministic") -> int:
     from engine.report import build_dry_run_report
 
@@ -639,10 +702,25 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
 
         best_pb = playbooks[0]
 
-        sizing = risk_mod.compute_risk_sizing(
-            symbol=sym, side=best_pb.side, entry=best_pb.entry, stop=best_pb.stop,
-            params=risk_params, best_bid=best_bid, best_ask=best_ask,
-        )
+        # Risk sizing — skip passive entry check when vulcan handles execution
+        vulcan_available = False
+        try:
+            from adapters.vulcan import VulcanAdapter
+            vulcan_available = VulcanAdapter.is_available()
+        except ImportError:
+            pass
+
+        if vulcan_available:
+            # Vulcan uses real market prices — skip synthetic passive entry check
+            sizing = risk_mod.compute_risk_sizing(
+                symbol=sym, side=best_pb.side, entry=best_pb.entry, stop=best_pb.stop,
+                params=risk_params,
+            )
+        else:
+            sizing = risk_mod.compute_risk_sizing(
+                symbol=sym, side=best_pb.side, entry=best_pb.entry, stop=best_pb.stop,
+                params=risk_params, best_bid=best_bid, best_ask=best_ask,
+            )
 
         if not sizing.valid:
             risk_mod.write_skipped_trade(
@@ -652,22 +730,47 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
             )
             continue
 
-        order = sizing.to_paper_order(
-            setup=best_pb.setup_type, tp1=best_pb.tp1, tp2=best_pb.tp2,
-            provenance_tags=f"run={run_id},score={score.weighted_score:.3f},setup={best_pb.setup_type}",
-        )
-        tracker.write_order(order)
+        # Execute via Vulcan if available, otherwise synthetic paper order
+        vulcan_result = None
+        if vulcan_available:
+            vulcan_result = _execute_trade_via_vulcan(
+                account_id=account_id,
+                symbol=sym,
+                side=best_pb.side.value,
+                notional_usdc=sizing.notional,
+                tp=best_pb.tp1,
+                sl=best_pb.stop,
+                run_id=run_id,
+            )
+
+        if vulcan_result:
+            fill = vulcan_result["fill"]
+            entry_price = fill.price
+            execution = "vulcan-phoenix"
+        else:
+            # Fallback: synthetic paper order
+            order = sizing.to_paper_order(
+                setup=best_pb.setup_type, tp1=best_pb.tp1, tp2=best_pb.tp2,
+                provenance_tags=f"run={run_id},score={score.weighted_score:.3f},setup={best_pb.setup_type}",
+            )
+            tracker.write_order(order)
+            entry_price = best_pb.entry
+            execution = "synthetic"
+
         kg.add(subject=sym, predicate="has_order", object_=run_id,
-               attrs={"side": best_pb.side.value, "entry": best_pb.entry, "stop": best_pb.stop},
+               attrs={"side": best_pb.side.value, "entry": entry_price, "stop": best_pb.stop,
+                       "execution": execution},
                source_name="Internal")
 
         final_trades.append({
             "symbol": sym, "side": best_pb.side.value, "setup": best_pb.setup_type,
-            "entry": best_pb.entry, "stop": best_pb.stop, "tp1": best_pb.tp1, "tp2": best_pb.tp2,
+            "entry": entry_price, "stop": best_pb.stop, "tp1": best_pb.tp1, "tp2": best_pb.tp2,
             "qty": sizing.qty, "notional": sizing.notional, "leverage": sizing.leverage,
             "risk_usd": sizing.risk_usd,
             "rationale": best_pb.rationale, "probability_band": best_pb.probability_band,
+            "execution": execution,
         })
+        print(f"[{run_id}]   {sym} {best_pb.side.value}: {execution} ${sizing.notional:.2f} @ {sizing.leverage:.1f}x")
 
     # --- Populate Report Sections C, D, E with real data ---
 
@@ -781,6 +884,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
     if final_trades:
         trade_lines = []
         for t in final_trades:
+            exec_venue = t.get("execution", "synthetic")
             trade_lines.append(
                 f"**{t['symbol']} {t['side'].upper()}**\n"
                 f"- Setup: {t['setup']} ({t.get('probability_band', 'N/A')} confidence)\n"
@@ -788,6 +892,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
                 f"- TP1: {t['tp1']:.2f} | TP2: {t['tp2']:.2f}\n"
                 f"- Qty: {t['qty']:.4f} | Notional: ${t['notional']:.2f}\n"
                 f"- Leverage: {t['leverage']:.1f}x | Risk: ${t['risk_usd']:.2f}\n"
+                f"- Execution: {exec_venue}\n"
                 f"- Rationale: {t.get('rationale', 'N/A')}\n"
             )
         report.set_section("F", "\n".join(trade_lines))
@@ -878,7 +983,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
             "qty": t["qty"],
             "notional": t["notional"],
             "leverage": t["leverage"],
-            "created_ts_aest": tracker.read_orders()[-1].created_ts_aest if tracker.read_orders() else aest_now_iso(),
+            "created_ts_aest": tracker.read_orders()[-1].created_ts_aest if tracker.read_orders() else datetime.now(AEST).strftime("%Y-%m-%d %H:%M:%S Australia/Sydney"),
             "fees_bps": 5.0,
             "slippage_bps": 3.0,
             "provenance_tags": f"run={run_id}",
@@ -1442,6 +1547,14 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     # --- Risk Sizing + Paper Order Writing ---
     final_trades: list[dict[str, Any]] = []
 
+    # Check vulcan availability once
+    vulcan_available = False
+    try:
+        from adapters.vulcan import VulcanAdapter
+        vulcan_available = VulcanAdapter.is_available()
+    except ImportError:
+        pass
+
     for cand in valid_candidates[:max_candidates]:
         if len(final_trades) >= max_open_trades:
             break
@@ -1451,13 +1564,19 @@ def _run_ai_paper(account_id: str = "ai") -> int:
         if price <= 0:
             price = cand.entry
 
-        best_bid = price * 0.9999
-        best_ask = price * 1.0001
-
-        sizing = risk_mod.compute_risk_sizing(
-            symbol=sym, side=cand.side, entry=cand.entry, stop=cand.stop,
-            params=risk_params, best_bid=best_bid, best_ask=best_ask,
-        )
+        # Risk sizing — skip passive entry check when vulcan handles execution
+        if vulcan_available:
+            sizing = risk_mod.compute_risk_sizing(
+                symbol=sym, side=cand.side, entry=cand.entry, stop=cand.stop,
+                params=risk_params,
+            )
+        else:
+            best_bid = price * 0.9999
+            best_ask = price * 1.0001
+            sizing = risk_mod.compute_risk_sizing(
+                symbol=sym, side=cand.side, entry=cand.entry, stop=cand.stop,
+                params=risk_params, best_bid=best_bid, best_ask=best_ask,
+            )
 
         if not sizing.valid:
             risk_mod.write_skipped_trade(
@@ -1468,24 +1587,48 @@ def _run_ai_paper(account_id: str = "ai") -> int:
             print(f"[{run_id}]   {sym} {cand.side.value}: REJECTED - {sizing.reject_reason}")
             continue
 
-        order = sizing.to_paper_order(
-            setup=cand.setup_type, tp1=cand.tp1, tp2=cand.tp2,
-            provenance_tags=f"run={run_id},mode=ai-paper,setup={cand.setup_type},band={cand.probability_band}",
-        )
-        tracker.write_order(order)
+        # Execute via Vulcan if available, otherwise synthetic paper order
+        vulcan_result = None
+        if vulcan_available:
+            vulcan_result = _execute_trade_via_vulcan(
+                account_id=account_id,
+                symbol=sym,
+                side=cand.side.value,
+                notional_usdc=sizing.notional,
+                tp=cand.tp1,
+                sl=cand.stop,
+                run_id=run_id,
+            )
+
+        if vulcan_result:
+            fill = vulcan_result["fill"]
+            entry_price = fill.price
+            execution = "vulcan-phoenix"
+        else:
+            # Fallback: synthetic paper order
+            order = sizing.to_paper_order(
+                setup=cand.setup_type, tp1=cand.tp1, tp2=cand.tp2,
+                provenance_tags=f"run={run_id},mode=ai-paper,setup={cand.setup_type},band={cand.probability_band}",
+            )
+            tracker.write_order(order)
+            entry_price = cand.entry
+            execution = "synthetic"
+
         kg.add(subject=sym, predicate="has_order", object_=run_id,
-               attrs={"side": cand.side.value, "entry": cand.entry, "stop": cand.stop,
-                       "setup": cand.setup_type, "rationale": cand.rationale},
+               attrs={"side": cand.side.value, "entry": entry_price, "stop": cand.stop,
+                       "setup": cand.setup_type, "rationale": cand.rationale,
+                       "execution": execution},
                source_name="AI-Agent")
 
         final_trades.append({
             "symbol": sym, "side": cand.side.value, "setup": cand.setup_type,
-            "entry": cand.entry, "stop": cand.stop, "tp1": cand.tp1, "tp2": cand.tp2,
+            "entry": entry_price, "stop": cand.stop, "tp1": cand.tp1, "tp2": cand.tp2,
             "qty": sizing.qty, "notional": sizing.notional, "leverage": sizing.leverage,
             "risk_usd": sizing.risk_usd,
             "rationale": cand.rationale, "probability_band": cand.probability_band,
+            "execution": execution,
         })
-        print(f"[{run_id}]   {sym} {cand.side.value}: order written, ${sizing.notional:.2f} @ {sizing.leverage:.1f}x")
+        print(f"[{run_id}]   {sym} {cand.side.value}: {execution} ${sizing.notional:.2f} @ {sizing.leverage:.1f}x")
 
     kg.flush()
 
@@ -1496,6 +1639,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     if final_trades:
         trade_lines = []
         for t in final_trades:
+            exec_venue = t.get("execution", "synthetic")
             trade_lines.append(
                 f"**{t['symbol']} {t['side'].upper()}**\n"
                 f"- Setup: {t['setup']} ({t.get('probability_band', 'N/A')} confidence)\n"
@@ -1503,6 +1647,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
                 f"- TP1: {t['tp1']:.2f} | TP2: {t['tp2']:.2f}\n"
                 f"- Qty: {t['qty']:.4f} | Notional: ${t['notional']:.2f}\n"
                 f"- Leverage: {t['leverage']:.1f}x | Risk: ${t['risk_usd']:.2f}\n"
+                f"- Execution: {exec_venue}\n"
                 f"- Rationale: {t.get('rationale', 'N/A')}\n"
             )
         report.set_section("F", "\n".join(trade_lines))
@@ -1594,7 +1739,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
             "qty": t["qty"],
             "notional": t["notional"],
             "leverage": t["leverage"],
-            "created_ts_aest": tracker.read_orders()[-1].created_ts_aest if tracker.read_orders() else aest_now_iso(),
+            "created_ts_aest": tracker.read_orders()[-1].created_ts_aest if tracker.read_orders() else datetime.now(AEST).strftime("%Y-%m-%d %H:%M:%S Australia/Sydney"),
             "fees_bps": 5.0,
             "slippage_bps": 3.0,
             "provenance_tags": f"run={run_id},mode=ai-paper",

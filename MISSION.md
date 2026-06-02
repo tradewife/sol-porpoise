@@ -1,228 +1,159 @@
-# Mission: Activate the Imperial Agent
+# Mission: Imperial Agent — 24-Hour Live-Paper Trial
 
-Previous mission spec archived at `archive/MISSION.md`.
+Previous mission specs archived at `archive/MISSION-v2-activation.md`.
 
-The scaffold and all engine modules are built (commit `43c8f3a`, 171 tests passing). The remaining work is to replace placeholders with real computation and close the gaps so the agent can produce its first meaningful paper trade.
+## Purpose
 
----
+Run the Imperial Agent in live-paper mode for 24 hours on an hourly cron schedule. The goal is to accumulate ~24 hourly scan cycles producing paper trade setups with entry, stop-loss, and take-profit levels. After 24 hours we will have enough data to assess:
 
-## Current State
+- **Signal quality**: Which of the 9 signal components produce winning trades?
+- **Setup hit rate**: Which playbook types (breakout, fade, momentum, etc.) work?
+- **System expectancy**: Is the average R per trade positive?
+- **Drawdown profile**: What's the worst peak-to-trough R over the trial?
 
-| Component | Status |
-|-----------|--------|
-| Config files | Done |
-| Ledger schemas | Done |
-| Memory files | Done |
-| Report template | Done |
-| Dry plumbing run | Done |
-| Imperial API adapter | Done (reads mark prices, funding, stats, OI, route) |
-| Flash Trade / Phantom MCP adapters | Done (normalization layers) |
-| Dextrabot scraper | Done (rate-limited, cached, entity classifier) |
-| KG triple writer | Done |
-| GraphSignalScore | Done (9 components, weights, unknown handling) |
-| Paper order model + fill logic | Done |
-| Outcome evaluator | Done |
-| Risk sizing | Done |
-| Cross-venue basis | Done |
-| Hypothesis registry | Done |
-| Source health tracker | Done |
-| Full scan loop | **Skeleton** -- runs but all signal components are `unknown`, stops use a 2% placeholder, side is guessed from zero-score |
-| 14-step report sections | **Partial** -- sections C, D, E are stubs, sections A-B and F-K are populated |
+## Key Design Decisions
 
-## What Is Not Yet Done
+1. **Hourly scans** — Cron fires every hour on the hour. Each scan fetches live data, extracts signals, generates playbooks, and writes paper orders.
+2. **Auto-evaluate before each scan** — Before placing new orders, the agent evaluates any open orders from the previous hour. This gives us clean outcome data on every trade.
+3. **Learning observer, not timid trader** — The agent should read signal outcome stats to learn which signals are performing well, but this learning must NOT reduce position sizing or make the agent more conservative. Every scan treats the opportunity fresh with full aggression. Prior outcomes are information only.
+4. **4 concurrent trades** — Up to 4 paper orders can be open at once, giving us more data per cycle.
+5. **1000 USDC equity** — Sized to allow multiple concurrent positions with 9-12x leverage.
+6. **No hard exit at 22:00** — The 22:00 hard exit rule is designed for 3x/day schedules. For hourly runs, we cancel stale orders via the 45-minute timeout instead.
 
-### 1. Volatility and Stop Math
+## What Needs to Change
 
-**File**: `engine/volatility.py` (new)
+### 1. Config Updates
 
-**What**: Compute 1h ATR, realized volatility, and regime classification from OHLCV candles.
+**File**: `config/run.yaml`
 
-**Interface**:
-```python
-def compute_atr(candles: list[Candle], period: int = 14) -> float
-def compute_realized_vol(candles: list[Candle], window: int = 24) -> float
-def classify_regime(atr: float, avg_atr: float) -> str  # Quiet/Normal/High/Extreme
-def compute_min_stop(atr_1h: float, entry: float, side: OrderSide) -> float
-    # max(0.8 * 1h ATR, nearest invalidation)
+Changes:
+- `schedule.scan_times`: Replace with hourly schedule (every hour, 00-23)
+- `schedule.cron_scan`: Update to `0 * * * *` (hourly)
+- `schedule.outcome_eval_time`: Remove or set to hourly as well
+- `account.equity`: Change from 100 to 1000
+- `account.max_open_trades`: Change from 2 to 4
+- `run.max_candidates`: Change from 2 to 3 (more candidates per scan)
+
+**File**: `config/risk.yaml`
+
+Changes:
+- `equity`: Change from 100 to 1000
+- `cancel_rules.timeout_minutes`: Change from 90 to 45 (orders older than 45 minutes are stale for hourly cycle)
+- `cancel_rules.hard_exit_time`: Remove or disable (not applicable to hourly schedule)
+- `portfolio.max_open_trades`: Change from 2 to 4
+
+### 2. Scan Loop: Auto-Evaluate Before New Orders
+
+**File**: `engine/run_scan.py`
+
+Add a pre-scan evaluation step at the start of `_run_live_paper()`:
+
+```
+Step 0a: If open_paper_orders is non-empty, run evaluate-outcomes logic inline:
+  - Fetch current mark prices for each open order
+  - Build candle from entry to current price
+  - Run evaluate_fill() for each order
+  - If filled + closed: compute outcome, write to outcomes.csv
+  - If cancel triggered: write cancel outcome
+  - Update mission_state.json (remove resolved, keep in-trade)
+  - Log evaluation results
 ```
 
-**Data source**: Imperial API candles (if available), or Phantom MCP `perps_markets` with mark-price history. Fall back to recent trade data from mark-price snapshots if candle endpoints are unavailable.
+This is NOT a separate mode call — it's inline at the start of the live-paper scan, before any new data fetching or signal extraction happens. The agent evaluates yesterday's (or last hour's) orders before placing new ones.
 
-**Integration**: `run_scan.py` Step 6 currently says `stop_pct = 0.02`. Replace with `compute_min_stop(atr, price, side)`.
+### 3. Signal Outcome Learning (Informational Only)
 
-**Tests**: Unit tests with known candle arrays producing correct ATR, vol, regime, and stop values.
+**File**: `engine/signals.py` or `engine/run_scan.py`
 
----
+Before signal extraction, read `signal_outcomes.csv` stats (if available) and log them. These stats are used for:
 
-### 2. Signal Extraction from Live Data
+- Report section output ("Signal performance: funding_stretch hit rate 62%, oi_delta 45%")
+- Future recommendation engine (weekly review already does this)
+- **NOT** for adjusting signal weights, confidence, or position sizing
 
-**File**: `engine/signals.py` (new)
+The agent must never let a losing streak on one signal reduce its conviction on the next occurrence. All 9 signals retain their fixed weights from `scoring.py` regardless of historical performance.
 
-**What**: Extract actual signal values from fetched DataPoints so GraphSignalScore has real inputs instead of all-unknown.
+### 4. Hourly Cron Script
 
-**Signals to extract**:
+**File**: `scripts/cron_hourly.sh` (new)
 
-| Signal | Source | Computation |
-|--------|--------|-------------|
-| `funding_stretch` | Imperial `funding-rates` | Current rate vs 7-day average. Stretch = `(current - avg) / stdev`. Positive stretch = bearish contrarian for funding fade. |
-| `oi_delta` | Imperial `stats/open-interest` + history | 24h OI change % and 1h OI change %. Rising OI + rising price = bullish momentum. Rising OI + falling price = bearish momentum. |
-| `basis` | Cross-venue mark prices | `compute_basis()` already exists in `engine/cross_venue.py`. Use it with Imperial vs Hyperliquid prices from Phantom MCP. |
-| `liquidity_magnet` | Imperial `phoenix/depth` or orderbook depth | Sum bid/ask depth within 0.5%, 1%, 2% of mid. Identify nearest large resting liquidity cluster. |
-| `session_structure` | Imperial candles or mark-price series | Compute VWAP for current session. Identify prior-day VAH/VAL/POC if enough history. |
-| `whale_evidence` | Dextrabot + Phantom positions | `integrate_whale_signals()` already exists. Wire it into the scan loop with actual fetched wallet data. |
-| `dex_perp_lag` | Imperial vs Phantom price timestamps | Compare last-update timestamps and price levels. If DEX leads perp, note direction. |
-| `volatility` | New `engine/volatility.py` | ATR percentile and regime. High vol = wider stops, lower confidence. |
-| `catalyst` | Open web scan (future) | For now, hard-code `unknown` with confidence 0. This is the 5% weight component and can wait. |
+A single cron-ready script that runs the full hourly cycle:
+1. Run evaluate-outcomes for any open orders
+2. Run live-paper scan for new candidates
+3. Log completion with timestamp
 
-**Interface**:
-```python
-def extract_signals(
-    symbol: str,
-    datapoints: list[DataPoint],
-    whale_points: list[DataPoint],
-    hl_points: list[DataPoint],
-    candles: list[Candle] | None = None,
-) -> dict[str, SignalComponent]
+The cron entry (not auto-installed, requires human approval):
+```
+0 * * * * /home/kt/imperial-agent/scripts/cron_hourly.sh >> /home/kt/imperial-agent/data/cron.log 2>&1
 ```
 
-**Integration**: `run_scan.py` Step 12 currently creates all-unknown components. Replace with `extract_signals()`.
+### 5. Trial Start/Stop Scripts
 
-**Tests**: Unit tests with fixture DataPoints producing correct signal values and labels.
+**File**: `scripts/trial_start.sh` (new)
+- Backs up current config to `data/trial_config_backup/`
+- Applies hourly trial config
+- Resets ledgers (or archives existing data)
+- Runs initial dry-run to verify config
+- Prints cron line for human to install
 
----
+**File**: `scripts/trial_stop.sh` (new)
+- Removes cron entry
+- Runs final outcome evaluation
+- Runs weekly review on trial data
+- Restores original config from backup
+- Prints trial summary (trade count, expectancy, hit rate)
 
-### 3. Playbook Generation
+### 6. Trial Dashboard
 
-**File**: `engine/playbooks.py` (new)
+**File**: `engine/trial_dashboard.py` (new)
 
-**What**: Given a scored symbol with signal components, generate up to 3 playbook candidates with concrete entry/stop/TP levels.
-
-**Setup types** (from MISSION.md):
-- `breakout` -- price above/below key level with OI rising
-- `fade` -- funding stretch mean reversion
-- `vwap_reclaim` -- price reclaiming session VWAP
-- `lvn_rejection` -- price rejecting at low volume node
-- `liquidity_sweep` -- price sweeping a visible liquidity pool
-- `funding_fade` -- fade extreme funding with OI divergence
-- `momentum_continuation` -- trend + OI alignment
-
-**Interface**:
-```python
-def generate_playbooks(
-    symbol: str,
-    price: float,
-    atr: float,
-    signals: dict[str, SignalComponent],
-    best_bid: float,
-    best_ask: float,
-) -> list[Playbook]
+A summary command that can be run at any time during the 24-hour trial:
+```
+.venv/bin/python -m engine.trial_dashboard
 ```
 
-Each `Playbook` has: setup_type, side, entry, stop, tp1, tp2, invalidation, expected_r_r, probability_band, rationale.
+Output:
+- Hours elapsed / hours remaining
+- Total scans completed
+- Paper orders placed (count, by symbol, by setup type)
+- Orders filled / cancelled / still open
+- Outcomes computed: win count, loss count, expectancy R
+- Best trade / worst trade
+- Per-signal hit rate
+- Per-setup-type hit rate
+- Current open positions with unrealized P&L
 
-**Integration**: `run_scan.py` Step 12 -- replace the current side/stop/TP placeholder logic with playbook output.
+## Operating Constraints
 
-**Tests**: Unit tests with known signal inputs producing correct playbook types and levels.
-
----
-
-### 4. Outcome Evaluation Loop
-
-**File**: `engine/run_scan.py` (extend)
-
-**What**: Implement the `--mode evaluate-outcomes` path in `run_scan.py`.
-
-**Logic**:
-1. Read `memory/mission_state.json` for open paper orders.
-2. For each open order, fetch current candle data (post-order timestamp).
-3. Run `evaluate_fill()` to check fill status.
-4. If filled, run `OutcomeEvaluator.compute_outcome()` and write to `outcomes.csv`.
-5. If cancel triggered, write cancel outcome with reason.
-6. Update `mission_state.json` open/unresolved lists.
-7. Compute and update `signal_outcomes.csv` stats.
-
-**Integration**: Wire into `scripts/evaluate_outcomes.sh`.
-
-**Tests**: Integration test: create a paper order, simulate post-order candle data, verify outcome is written correctly.
-
----
-
-### 5. Live Smoke Test
-
-**What**: Run the agent end-to-end against live APIs and verify it produces a meaningful report.
-
-**Steps**:
-1. Run `./scripts/run_scan.sh --mode live-paper`.
-2. Verify the Imperial API returns real data (mark prices, funding, stats).
-3. Verify the report contains actual prices (not N/A).
-4. Verify GraphSignalScore has at least `funding_stretch`, `oi_delta`, and `basis` populated with real values.
-5. If the scan produces paper candidates, verify they appear in `ledgers/paper_orders.csv` with valid entries.
-6. If no candidates meet the bar, verify the report says `no_trade` with a real reason.
-
-**Gate**: This is the gate that confirms the agent is production-ready for cron scheduling.
-
----
-
-### 6. Weekly Review Command
-
-**File**: `engine/weekly_review.py` (new)
-
-**What**: Summarize paper-trade performance over the past week.
-
-**Output**:
-- Paper-trade expectancy (avg R per trade)
-- Drawdown (worst peak-to-trough R)
-- Profit factor (gross wins / gross losses)
-- Fill rate, cancel rate, no-trade rate
-- Per-signal hit rate and avg R (from `signal_outcomes.csv`)
-- Top 3 improvement recommendations ranked by expected impact
-- One highest-impact implementation pick for next build cycle
-
-**Interface**:
-```python
-def run_weekly_review(
-    outcomes_path: Path,
-    signal_outcomes_path: Path,
-    paper_orders_path: Path,
-) -> WeeklyReviewResult
-```
-
-**Integration**: `scripts/weekly_review.sh` (new), cron-ready.
-
-**Tests**: Unit tests with fixture outcome data producing correct metrics.
-
----
+- Mode remains `live-paper-only` throughout. No live trading.
+- All paper trades are generated from live market snapshots.
+- The agent does not sign transactions or move funds.
+- Signal learning is informational only — never reduces aggression.
 
 ## Milestones
 
-### Milestone A: Volatility + Signal Extraction
+### Milestone A: Config + Auto-Evaluate + Cron Script
 
-**Deliver**: `engine/volatility.py`, `engine/signals.py`, integration into `run_scan.py` replacing placeholders. Real ATR-based stops, real signal component values for funding, OI, basis, volatility.
+**Deliver**: Updated configs (run.yaml, risk.yaml) for hourly operation with 1000 USDC. Auto-evaluate step wired into scan loop. `scripts/cron_hourly.sh` created. `scripts/trial_start.sh` and `scripts/trial_stop.sh` created.
 
-**Validation**: `pytest tests/ -v` passes. A live-paper run produces a report with at least 4 non-unknown signal components per scored symbol.
+**Validation**: Run `./scripts/trial_start.sh` then `./scripts/cron_hourly.sh` manually. Verify config is applied, evaluate step runs, scan completes with report generated.
 
-### Milestone B: Playbooks + Complete Scan Loop
+### Milestone B: Trial Dashboard + Learning Output
 
-**Deliver**: `engine/playbooks.py`, full integration. Sections C, D, E of the report contain real evidence tables. Side selection is driven by signal direction, not guesswork.
+**Deliver**: `engine/trial_dashboard.py` with live summary. Signal outcome stats logged in report. Learning output visible but not affecting trade decisions.
 
-**Validation**: Report sections C, D, E contain actual data, not stubs.
+**Validation**: Run dashboard after a few manual hourly scans. Verify it shows correct counts and metrics.
 
-### Milestone C: Outcome Evaluation + Weekly Review
+### Milestone C: 24-Hour Trial Execution
 
-**Deliver**: `--mode evaluate-outcomes` path, `engine/weekly_review.py`, `scripts/weekly_review.sh`.
+**Deliver**: Install cron (with human approval), run for 24 hours, collect results, produce final assessment.
 
-**Validation**: Can create a paper order, evaluate it against subsequent data, and produce an outcome row.
+**Validation**: After 24 hours, run `./scripts/trial_stop.sh` and verify final summary shows meaningful data (24+ scans, multiple paper trades, outcome metrics).
 
-### Milestone D: Live Smoke Test
+## Success Criteria
 
-**Deliver**: Successful end-to-end run against live Imperial API with real data in the report.
-
-**Validation**: Report contains real prices, real funding rates, real OI, at least one scored candidate (even if no trade is the final decision).
-
-## Operating Constraints (unchanged)
-
-- Default mode is `live-paper-only`.
-- Do not place live orders, sign transactions, move funds, or spend paid API budget without explicit human approval.
-- Paper trades must be generated from live market snapshots before outcomes occur.
-- Every metric row must carry provenance.
-- Mode is read from `memory/mission_state.json` at the start of every run.
+- Agent runs 24 hourly cycles without crashing
+- At least 15 out of 24 cycles produce either a paper trade or a documented no-trade reason
+- At least 8 paper orders are generated across the trial
+- Outcome evaluation fills in R-values for at least 50% of closed orders
+- Weekly review / trial dashboard produces actionable signal quality data

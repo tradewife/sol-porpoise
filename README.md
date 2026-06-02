@@ -8,7 +8,7 @@ The full mission spec is in `MISSION.md`.
 
 **Mode: `live-paper-only`** -- no live trading, no signing, no fund movement.
 
-All 8 milestones are implemented. 171 tests pass. The agent can run a full 14-step scan loop that fetches live market data, scores candidates, sizes positions, writes paper orders, and generates timestamped reports.
+All milestones are complete. **414 tests pass.** The agent runs a full 14-step scan loop with real signal extraction, ATR-based stops, playbook-driven trade construction, forward outcome evaluation, and weekly review — all verified against the live Imperial API.
 
 ## What's Built
 
@@ -21,19 +21,23 @@ All 8 milestones are implemented. 171 tests pass. The agent can run a full 14-st
 ### Adapters (`adapters/`)
 - `base.py` -- DataPoint, Provenance, SourceTier, AdapterHealth, DataAdapter protocol
 - `normalizer.py` -- symbol normalization (BTC-PERP -> BTC), consistent provenance tagging
-- `imperial.py` -- Imperial API client: mark prices, funding rates, stats/markets, OI history, route cost breakdown, status
+- `imperial.py` -- Imperial API client: mark prices, funding rates, stats/markets, OI history, route cost breakdown, status, depth data, candle history
 - `flash_trade.py` -- Flash Trade MCP normalization layer (markets, prices, leverage, pool utilization)
 - `phantom.py` -- Phantom MCP normalization layer (Hyperliquid markets, funding, OI, positions)
 - `dextrabot.py` -- Web scraper with rate limiting, response caching, entity classification (smart_money / whale_unlabeled / unknown)
 
 ### Engine (`engine/`)
-- `report.py` -- Markdown report writer with all A-K sections, AEST timestamps, run IDs
-- `run_scan.py` -- Full 14-step scan loop: universe selection, data fetch, scoring, sizing, paper order creation, report generation, mission state persistence
+- `volatility.py` -- ATR computation (1h / 14-period), realized volatility, regime classification (Quiet/Normal/High/Extreme), ATR-based minimum stop distance (replaces 2% placeholder)
+- `signals.py` -- Real signal extraction from live DataPoints: `funding_stretch` (rate vs 7d avg/stdev), `oi_delta` (24h/1h OI change % with direction), `basis` (Imperial vs Hyperliquid bp), `liquidity_magnet` (depth within 0.5%/1%/2%), `session_structure` (session VWAP, VAH/VAL/POC), `whale_evidence` (Dextrabot + wallet positions), `dex_perp_lag` (timestamp/price cross-venue), `volatility` (ATR percentile + regime), `catalyst` (placeholder with confidence 0)
+- `playbooks.py` -- Playbook generation with 7 setup types: `breakout`, `fade`, `vwap_reclaim`, `lvn_rejection`, `liquidity_sweep`, `funding_fade`, `momentum_continuation`. Each playbook includes entry, stop, TP1/TP2, invalidation level, expected R:R, probability band, and rationale
 - `scoring.py` -- GraphSignalScore with 9 weighted components (funding 15%, OI 15%, basis 10%, liquidity 15%, session 10%, whale 10%, DEX/lag 10%, volatility 10%, catalyst 5%), unknown handling, conflict logging
+- `run_scan.py` -- Full 14-step scan loop with 3 modes: `plumbing-dry-run`, `live-paper`, `evaluate-outcomes`. Universe selection, data fetch (Imperial + Flash Trade + Phantom + Dextrabot), signal extraction, scoring, playbook selection, ATR-based position sizing, paper order creation, report generation, mission state persistence. `evaluate-outcomes` mode reads open orders, fetches mark prices, evaluates fills, computes outcomes (R/MAE/MFE with fee/slippage deduction), enforces cancel rules, writes signal attribution
+- `report.py` -- Markdown report writer with all A-K sections populated with real data (sections C/D/E include evidence tables, signal breakdowns, and playbook details), AEST timestamps, run IDs
+- `weekly_review.py` -- Weekly review: paper-trade expectancy, max drawdown, profit factor, fill/cancel/no-trade rates, per-signal stats, top 3 recommendations, next build pick. Returns `WeeklyReviewResult` dataclass
 - `kg.py` -- Knowledge graph triple writer (SYMBOL, VENUE, WALLET, SIGNAL, etc.), CSV persistence, query support
 - `paper_orders.py` -- Paper order model, maker-only fill logic, cancel rules (timeout/drift/hard exit), passive entry validation, conservative same-candle resolution
 - `outcomes.py` -- Outcome evaluator (R, MAE, MFE, fees, slippage), signal-to-outcome attribution
-- `risk.py` -- Position sizing (risk_usd / stop_distance, leverage cap, lot rounding), passive entry gate, skipped trade logging
+- `risk.py` -- Position sizing (risk_usd / ATR-based stop_distance, leverage cap, lot rounding), passive entry gate, skipped trade logging
 - `cross_venue.py` -- Basis comparison (bp), volume/OI dominance, whale signal integration (evidence-only, never copy-trade), conflict detection
 - `hypothesis.py` -- Hypothesis registry CRUD (active/rejected/superseded)
 - `source_health.py` -- Source health tracker (latency, freshness, confidence adjustment), signal outcome scorer
@@ -52,14 +56,15 @@ All 10 ledger files with correct schemas per MISSION.md:
 - `durable_lessons.md`, `adapter_registry.md`, `failure_modes.md`, `promotion_decisions.md`
 
 ### Scripts (`scripts/`)
-- `run_scan.sh` -- Cron entry point, accepts `--mode live-paper` or `--mode plumbing-dry-run`
-- `evaluate_outcomes.sh` -- Outcome evaluation runner
+- `run_scan.sh` -- Cron entry point, accepts `--mode plumbing-dry-run`, `--mode live-paper`, or `--mode evaluate-outcomes`
+- `evaluate_outcomes.sh` -- Outcome evaluation runner (delegates to `run_scan.sh --mode evaluate-outcomes`)
+- `weekly_review.sh` -- Weekly review cron entry point
 
 ### Reports (`reports/`)
-Timestamped markdown reports with sections A-K, generated by each scan run.
+Timestamped markdown reports with sections A-K, generated by each scan run. Sections C (evidence), D (signal breakdown), and E (playbook details) are populated with real data.
 
 ### Tests (`tests/`)
-171 tests across 7 test files covering all validation contracts.
+414 tests across test files covering all validation contracts, integration tests, and cross-module pipelines.
 
 ## Quick Commands
 
@@ -69,6 +74,12 @@ Timestamped markdown reports with sections A-K, generated by each scan run.
 
 # Live paper scan (fetches data, may create paper orders)
 ./scripts/run_scan.sh --mode live-paper
+
+# Evaluate open paper orders against current prices
+./scripts/run_scan.sh --mode evaluate-outcomes
+
+# Weekly review of paper-trade performance
+./scripts/weekly_review.sh
 
 # Run tests
 .venv/bin/python -m pytest tests/ -v
@@ -88,11 +99,9 @@ Timestamped markdown reports with sections A-K, generated by each scan run.
 
 These areas need real-world exercising and refinement:
 
-- **ATR / volatility computation** -- stop distances currently use a 2% placeholder
-- **Session structure analysis** -- VWAP, VAH/VAL/POC, HVN/LVN not computed
-- **Catalyst scan** -- no macro/token unlock/maintenance calendar integration
-- **Whale intelligence in production** -- Dextrabot scraping works but needs live HTML verification
-- **Outcome evaluation loop** -- `evaluate_outcomes.sh` placeholder exists but doesn't process open orders yet
-- **Weekly review command** -- not yet wired
+- **Catalyst scan** -- no macro/token unlock/maintenance calendar integration (currently returns `unknown` with confidence 0; 5% weight)
+- **Whale intelligence in production** -- Dextrabot scraping works but needs live HTML verification for entity classification accuracy
 - **Cron installation** -- not auto-installed (requires human approval)
+- **Promotion gates** -- 0/8 passed; requires accumulated paper-trade history before live promotion can be considered
+- **Live trading** -- blocked on promotion gates and explicit human approval
 

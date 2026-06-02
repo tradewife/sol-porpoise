@@ -29,6 +29,9 @@ data/snapshots/*
 .DS_Store
 Thumbs.db
 
+# Generated reports (ephemeral, timestamped)
+reports/*.md
+
 # Distribution
 dist/
 build/

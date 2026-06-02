@@ -1,64 +1,19 @@
-# run.yaml — Runtime parameters for the Imperial live-paper trading agent.
-#
-# This file controls the agent's operating mode, schedule, and account
-# configuration.  It is loaded at the start of every scan run.
-
-# ---------------------------------------------------------------------------
-# Operating mode
-# ---------------------------------------------------------------------------
-# Allowed values:
-#   live-paper-only   — Default. Creates non-executing paper orders from live
-#                        market snapshots. No real orders, signing, or fund
-#                        movement.
-#   plumbing-dry-run  — Validates adapters, schemas, and report templates
-#                        without producing paper trade outcomes.
-#   human-approved-live — Live-capped mode. Requires explicit human approval
-#                        and must not be set automatically by any agent code.
 mode: live-paper-only
-
-# ---------------------------------------------------------------------------
-# Schedule (Australia/Sydney timezone)
-# ---------------------------------------------------------------------------
-# Cron-ready schedule for the 14-step scan loop. Times are in AEST/AEDT.
-# Not auto-installed — requires explicit human approval to add to crontab.
 schedule:
-  timezone: "Australia/Sydney"
-  # Hourly scan — every hour on the hour for 24-hour trial.
-  # Auto-evaluate runs inline at the start of each scan cycle, so a separate
-  # outcome-eval cron entry is not needed.
-  cron_scan: "0 * * * *"
-  # No forced hard-exit window in hourly mode; cancel timeout (45 min) handles
-  # stale orders within each cycle.
-  cron_outcome_eval: ""
-
-# ---------------------------------------------------------------------------
-# Account parameters
-# ---------------------------------------------------------------------------
+  timezone: Australia/Sydney
+  cron_scan: 0 * * * *
+  cron_outcome_eval: ''
 account:
-  # Starting equity in USDC for paper trading.
-  # This is the reference balance for risk sizing and R-multiple calculations.
   equity: 1000
   currency: USDC
-  # Risk profile: controls how aggressively the agent sizes positions.
-  # "Aggressive-Paper" allows the full 20% risk budget per trade.
   risk_profile: Aggressive-Paper
-  # Maximum number of concurrent open paper trades.
   max_open_trades: 4
-
-# ---------------------------------------------------------------------------
-# Run behaviour
-# ---------------------------------------------------------------------------
 run:
-  # Maximum number of paper trade candidates to output per scan.
   max_candidates: 3
-  # Always include these symbols in the universe.
   always_include:
-    - BTC
-    - ETH
-    - SOL
-  # Number of additional trending markets to select from volume/OI movers.
+  - BTC
+  - ETH
+  - SOL
   additional_trending_count: 5
-  # Report output directory (relative to project root).
   report_dir: reports
-  # Ledger output directory (relative to project root).
   ledger_dir: ledgers

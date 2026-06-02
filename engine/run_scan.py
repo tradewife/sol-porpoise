@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import shlex
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -21,15 +24,32 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 AEST = ZoneInfo("Australia/Sydney")
 
 
-def _load_mission_state() -> dict:
-    state_path = PROJECT_ROOT / "memory" / "mission_state.json"
+def _account_root(account_id: str) -> Path:
+    """Resolve the account root directory.
+
+    If accounts/<id>/ exists (or can be created), use it.
+    Otherwise fall back to PROJECT_ROOT directly (legacy / test compatibility).
+    """
+    acct = PROJECT_ROOT / "accounts" / account_id
+    # If accounts/ dir exists at all, use account isolation
+    if (PROJECT_ROOT / "accounts").exists() or acct.exists():
+        acct.mkdir(parents=True, exist_ok=True)
+        for sub in ("ledgers", "reports", "memory", "data"):
+            (acct / sub).mkdir(exist_ok=True)
+        return acct
+    # Legacy: no accounts/ dir, use project root directly
+    return PROJECT_ROOT
+
+
+def _load_mission_state(account_id: str = "deterministic") -> dict:
+    state_path = _account_root(account_id) / "memory" / "mission_state.json"
     if state_path.exists():
         return json.loads(state_path.read_text(encoding="utf-8"))
     return {}
 
 
-def _save_mission_state(state: dict) -> None:
-    state_path = PROJECT_ROOT / "memory" / "mission_state.json"
+def _save_mission_state(state: dict, account_id: str = "deterministic") -> None:
+    state_path = _account_root(account_id) / "memory" / "mission_state.json"
     state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -42,6 +62,7 @@ def _load_yaml_config(name: str) -> dict:
 
 
 def _save_mission_state_to(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -167,19 +188,29 @@ def _format_signal_learning_section(stats: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _run_plumbing_dry_run() -> int:
+def _run_plumbing_dry_run(account_id: str = "deterministic") -> int:
     from engine.report import build_dry_run_report
 
-    report_dir = PROJECT_ROOT / "reports"
+    acct = _account_root(account_id)
+    report_dir = acct / "reports"
     path = build_dry_run_report(report_dir)
 
-    paper_orders = PROJECT_ROOT / "ledgers" / "paper_orders.csv"
+    paper_orders = acct / "ledgers" / "paper_orders.csv"
+    if not paper_orders.exists():
+        paper_orders.parent.mkdir(parents=True, exist_ok=True)
+        paper_orders.write_text(
+            "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
+            "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
+            "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags\n",
+            encoding="utf-8",
+        )
     lines = paper_orders.read_text(encoding="utf-8").strip().split("\n")
     assert len(lines) == 1, "paper_orders.csv must have only header row in dry run"
 
     print(f"[dry-run] Report written to {path}")
     print(f"[dry-run] Status: no_trade")
     print(f"[dry-run] paper_orders.csv: header only (verified)")
+    print(f"[dry-run] Account: {account_id}")
     return 0
 
 
@@ -326,7 +357,7 @@ def _auto_evaluate_open_orders(
     return remaining_orders
 
 
-def _run_live_paper() -> int:
+def _run_live_paper(account_id: str = "deterministic") -> int:
     """Execute the full 14-step scan loop for live paper trading."""
     import adapters.imperial as imperial_mod
     import adapters.flash_trade as ft_mod
@@ -343,7 +374,8 @@ def _run_live_paper() -> int:
     from engine.paper_orders import OrderSide
 
     # Step 0: Mission Init
-    state = _load_mission_state()
+    acct = _account_root(account_id)
+    state = _load_mission_state(account_id)
     mode = state.get("mode", "unknown")
     if mode != "live-paper-only":
         print(f"[FATAL] Mode is '{mode}', expected 'live-paper-only'. Aborting.", file=sys.stderr)
@@ -355,7 +387,7 @@ def _run_live_paper() -> int:
     timestamp_aest = datetime.now(AEST).strftime("%Y-%m-%d %H:%M:%S Australia/Sydney")
 
     print(f"[{run_id}] Starting live-paper scan at {timestamp_aest}")
-    print(f"[{run_id}] Mode: {mode}")
+    print(f"[{run_id}] Mode: {mode} | Account: {account_id}")
 
     # Load previous state
     open_orders = state.get("open_paper_orders", [])
@@ -363,17 +395,17 @@ def _run_live_paper() -> int:
     print(f"[{run_id}] Previous open orders: {len(open_orders)}, unresolved: {len(unresolved)}")
 
     # Initialize components
-    report = report_mod.ReportWriter(PROJECT_ROOT / "reports")
-    report.set_section("A", f"Run {run_id} started at {timestamp_aest}. Mode: {mode}.")
-    kg = kg_mod.KGWriter(PROJECT_ROOT / "ledgers" / "kg_triples.csv")
+    report = report_mod.ReportWriter(acct / "reports")
+    report.set_section("A", f"Run {run_id} started at {timestamp_aest}. Mode: {mode}. Account: {account_id}.")
+    kg = kg_mod.KGWriter(acct / "ledgers" / "kg_triples.csv")
     imperial = imperial_mod.ImperialAdapter()
     ft_adapter = ft_mod.FlashTradeAdapter()
     phantom = phantom_mod.PhantomAdapter()
     dext = dext_mod.DextrabotAdapter(cache_dir=str(PROJECT_ROOT / "data" / "raw"))
-    tracker = po_mod.PaperOrderTracker(PROJECT_ROOT / "ledgers" / "paper_orders.csv")
+    tracker = po_mod.PaperOrderTracker(acct / "ledgers" / "paper_orders.csv")
     evaluator = outcomes_mod.OutcomeEvaluator(
-        outcomes_path=PROJECT_ROOT / "ledgers" / "outcomes.csv",
-        signal_outcomes_path=PROJECT_ROOT / "ledgers" / "signal_outcomes.csv",
+        outcomes_path=acct / "ledgers" / "outcomes.csv",
+        signal_outcomes_path=acct / "ledgers" / "signal_outcomes.csv",
     )
     risk_params = risk_mod.RiskParams(
         equity=risk_config.get("equity", 100),
@@ -395,14 +427,14 @@ def _run_live_paper() -> int:
         )
         # Update state with evaluated orders
         state["open_paper_orders"] = remaining_orders
-        _save_mission_state(state)
+        _save_mission_state(state, account_id)
         open_orders = remaining_orders
         print(f"[{run_id}] Auto-evaluate complete. Remaining open: {len(open_orders)}")
     else:
         print(f"[{run_id}] Auto-evaluate: no open orders to evaluate.")
 
     # --- Signal Learning Output (informational only, before signal extraction) ---
-    signal_outcomes_csv = PROJECT_ROOT / "ledgers" / "signal_outcomes.csv"
+    signal_outcomes_csv = acct / "ledgers" / "signal_outcomes.csv"
     signal_stats = _read_signal_outcome_stats(signal_outcomes_csv)
     report.set_section("L", _format_signal_learning_section(signal_stats))
     if signal_stats:
@@ -599,7 +631,7 @@ def _run_live_paper() -> int:
         if not playbooks:
             # No playbook qualifies → skip with reason
             risk_mod.write_skipped_trade(
-                csv_path=PROJECT_ROOT / "ledgers" / "skipped_trades.csv",
+                csv_path=acct / "ledgers" / "skipped_trades.csv",
                 symbol=sym, side="none", reason="no_playbook_qualified",
                 entry=price, stop=0,
             )
@@ -614,7 +646,7 @@ def _run_live_paper() -> int:
 
         if not sizing.valid:
             risk_mod.write_skipped_trade(
-                csv_path=PROJECT_ROOT / "ledgers" / "skipped_trades.csv",
+                csv_path=acct / "ledgers" / "skipped_trades.csv",
                 symbol=sym, side=best_pb.side.value, reason=sizing.reject_reason,
                 entry=best_pb.entry, stop=best_pb.stop,
             )
@@ -856,7 +888,7 @@ def _run_live_paper() -> int:
     ]
     # Preserve in-trade/pending orders from auto-evaluate alongside new trades
     state["open_paper_orders"] = open_orders + new_trade_orders
-    _save_mission_state(state)
+    _save_mission_state(state, account_id)
 
     print(f"[{run_id}] Status: {status}")
     print(f"[{run_id}] Paper trades: {len(final_trades)}")
@@ -885,7 +917,7 @@ def _reconstruct_order(data: dict) -> "paper_orders.PaperOrder":
     )
 
 
-def _run_evaluate_outcomes(base_path: Path | None = None) -> int:
+def _run_evaluate_outcomes(base_path: Path | None = None, account_id: str = "deterministic") -> int:
     """Evaluate open paper orders against post-order market data.
 
     Reads open orders from mission_state.json, fetches current prices,
@@ -894,7 +926,10 @@ def _run_evaluate_outcomes(base_path: Path | None = None) -> int:
     import engine.paper_orders as po_mod
     import engine.outcomes as outcomes_mod
 
-    root = base_path or PROJECT_ROOT
+    if base_path:
+        root = base_path
+    else:
+        root = _account_root(account_id)
     state_path = root / "memory" / "mission_state.json"
 
     # Handle missing state file
@@ -1060,22 +1095,555 @@ def _run_evaluate_outcomes(base_path: Path | None = None) -> int:
     return 0
 
 
+def _run_ai_paper(account_id: str = "ai") -> int:
+    """Execute the AI-agent scan loop for paper trading.
+
+    Uses AI reasoning (via MCP tools) instead of deterministic signal scoring.
+    Reuses the same risk sizing, paper order writing, outcome evaluation,
+    and report generation as _run_live_paper().
+    """
+    import adapters.imperial as imperial_mod
+    import engine.ai_agent as ai_mod
+    import engine.kg as kg_mod
+    import engine.mcp_data as mcp_mod
+    import engine.outcomes as outcomes_mod
+    import engine.paper_orders as po_mod
+    import engine.report as report_mod
+    import engine.risk as risk_mod
+    import engine.skills as skills_mod
+    from engine.paper_orders import OrderSide
+
+    # Step 0: Mission Init
+    acct = _account_root(account_id)
+    state = _load_mission_state(account_id)
+    mode = state.get("mode", "unknown")
+    if mode not in ("live-paper-only", "ai-paper-only"):
+        print(f"[INFO] Mode is '{mode}', treating as ai-paper for this run.")
+
+    run_config = _load_yaml_config("run")
+    risk_config = _load_yaml_config("risk")
+    ai_config = _load_yaml_config("ai_agent")
+    run_id = datetime.now(AEST).strftime("run_%Y%m%dT%H%M%S_AEST")
+    timestamp_aest = datetime.now(AEST).strftime("%Y-%m-%d %H:%M:%S Australia/Sydney")
+
+    print(f"[{run_id}] Starting AI-agent paper scan at {timestamp_aest}")
+    print(f"[{run_id}] Mode: ai-paper | Account: {account_id}")
+
+    open_orders = state.get("open_paper_orders", [])
+    print(f"[{run_id}] Previous open orders: {len(open_orders)}")
+
+    # Initialize components
+    report = report_mod.ReportWriter(acct / "reports")
+    report.set_section("A", f"Run {run_id} started at {timestamp_aest}. Mode: ai-paper (AI reasoning via MCP tools). Account: {account_id}.")
+    kg = kg_mod.KGWriter(acct / "ledgers" / "kg_triples.csv")
+    tracker = po_mod.PaperOrderTracker(acct / "ledgers" / "paper_orders.csv")
+    evaluator = outcomes_mod.OutcomeEvaluator(
+        outcomes_path=acct / "ledgers" / "outcomes.csv",
+        signal_outcomes_path=acct / "ledgers" / "signal_outcomes.csv",
+    )
+    risk_params = risk_mod.RiskParams(
+        equity=risk_config.get("equity", 1000),
+        max_risk_pct=risk_config.get("max_risk_pct", 0.20),
+        leverage_min=risk_config.get("leverage", {}).get("min", 9),
+        leverage_max=risk_config.get("leverage", {}).get("max", 12),
+    )
+
+    max_candidates = ai_config.get("ai", {}).get("max_candidates",
+                        run_config.get("run", {}).get("max_candidates", 3))
+    max_open_trades = run_config.get("account", {}).get("max_open_trades", 4)
+
+    # --- Auto-Evaluate open orders from previous cycle ---
+    cancel_timeout = risk_config.get("cancel_rules", {}).get("timeout_minutes", 45)
+    if open_orders:
+        print(f"[{run_id}] Auto-evaluating {len(open_orders)} open order(s)...")
+        remaining_orders = _auto_evaluate_open_orders(
+            open_orders=open_orders, evaluator=evaluator,
+            cancel_timeout=cancel_timeout, run_id=run_id,
+        )
+        state["open_paper_orders"] = remaining_orders
+        _save_mission_state(state, account_id)
+        open_orders = remaining_orders
+    else:
+        print(f"[{run_id}] Auto-evaluate: no open orders to evaluate.")
+
+    # --- Signal Learning Output ---
+    signal_outcomes_csv = acct / "ledgers" / "signal_outcomes.csv"
+    signal_stats = _read_signal_outcome_stats(signal_outcomes_csv)
+    report.set_section("L", _format_signal_learning_section(signal_stats))
+
+    # --- Gather Market Data ---
+    # Try MCP tools first, fall back to Imperial API
+    rich_data = mcp_mod.RichMarketData()
+    all_datapoints: list[Any] = []
+
+    # Phase 1: Try Flash Trade MCP for trading overview
+    mcp_overview_raw = state.get("_mcp_trading_overview")
+    if mcp_overview_raw and isinstance(mcp_overview_raw, dict):
+        rich_data.markets = mcp_mod.parse_trading_overview(mcp_overview_raw)
+        for m in rich_data.markets:
+            rich_data.raw_prices[m.symbol] = m.price
+        print(f"[{run_id}] MCP trading overview: {len(rich_data.markets)} markets")
+
+    # Phase 2: Try Phantom MCP for perps account and positions
+    mcp_account_raw = state.get("_mcp_perps_account")
+    if mcp_account_raw and isinstance(mcp_account_raw, dict):
+        rich_data.account = mcp_mod.parse_account_summary(mcp_account_raw)
+        print(f"[{run_id}] MCP perps account: ${rich_data.account.available_usd:.2f} available")
+
+    mcp_positions_raw = state.get("_mcp_perps_positions")
+    if mcp_positions_raw and isinstance(mcp_positions_raw, (dict, list)):
+        existing_positions = mcp_mod.parse_perps_positions(mcp_positions_raw)
+        if rich_data.account:
+            rich_data.account.positions = existing_positions
+        print(f"[{run_id}] MCP existing positions: {len(existing_positions)}")
+
+    # Phase 3: Try Phantom MCP for HL market data (funding, OI, volume)
+    mcp_markets_raw = state.get("_mcp_perps_markets")
+    if mcp_markets_raw and isinstance(mcp_markets_raw, dict):
+        hl_markets = mcp_mod.parse_perps_markets(mcp_markets_raw)
+        for sym, mkt in hl_markets.items():
+            if "fundingRate" in mkt or "funding" in mkt:
+                fr = mkt.get("fundingRate", mkt.get("funding", 0))
+                if fr is not None:
+                    rich_data.funding_rates[sym] = float(fr)
+            if "openInterest" in mkt or "oi" in mkt:
+                oi = mkt.get("openInterest", mkt.get("oi", 0))
+                if oi is not None:
+                    rich_data.open_interest[sym] = float(oi)
+            if "volume24h" in mkt or "volume" in mkt:
+                vol = mkt.get("volume24h", mkt.get("volume", 0))
+                if vol is not None:
+                    rich_data.volume_24h[sym] = float(vol)
+        print(f"[{run_id}] MCP HL markets: {len(hl_markets)} symbols with data")
+
+    # Phase 4: Flash Trade MCP prices (supplement)
+    mcp_prices_raw = state.get("_mcp_prices")
+    if mcp_prices_raw and isinstance(mcp_prices_raw, dict):
+        for sym, price in mcp_prices_raw.items():
+            sym_upper = str(sym).upper()
+            try:
+                rich_data.raw_prices[sym_upper] = float(price)
+            except (TypeError, ValueError):
+                pass
+
+    # Phase 5: Flash Trade pool data
+    mcp_pool_raw = state.get("_mcp_pool_data")
+    if mcp_pool_raw and isinstance(mcp_pool_raw, (dict, list)):
+        pool_items = mcp_pool_raw if isinstance(mcp_pool_raw, list) else [mcp_pool_raw]
+        rich_data.pool_data = pool_items
+
+    # Convert MCP data to DataPoints for reports/ledgers
+    all_datapoints.extend(mcp_mod.overview_to_datapoints(rich_data))
+
+    # Fallback: Imperial API if MCP data is thin
+    if not rich_data.raw_prices:
+        print(f"[{run_id}] No MCP prices, falling back to Imperial API...")
+        imperial = imperial_mod.ImperialAdapter()
+        try:
+            mark_prices = imperial.fetch_mark_prices()
+            all_datapoints.extend(mark_prices)
+            for dp in mark_prices:
+                if "mark_price" in dp.metric and isinstance(dp.value, (int, float)) and dp.value > 0:
+                    rich_data.raw_prices[dp.symbol] = dp.value
+            print(f"[{run_id}] Imperial fallback: {len(rich_data.raw_prices)} prices")
+        except Exception as e:
+            print(f"[{run_id}] WARNING: Imperial fallback failed: {e}")
+
+    if not rich_data.funding_rates:
+        imperial = imperial_mod.ImperialAdapter()
+        try:
+            funding = imperial.fetch_funding_rates()
+            all_datapoints.extend(funding)
+            for dp in funding:
+                if "funding" in dp.metric and isinstance(dp.value, (int, float)):
+                    rich_data.funding_rates[dp.symbol] = dp.value
+        except Exception:
+            pass
+
+    if not rich_data.volume_24h:
+        imperial = imperial_mod.ImperialAdapter()
+        try:
+            stats = imperial.fetch_stats_markets()
+            all_datapoints.extend(stats)
+            for dp in stats:
+                if dp.metric == "volume_24h" and isinstance(dp.value, (int, float)):
+                    rich_data.volume_24h[dp.symbol] = dp.value
+                elif dp.metric == "open_interest" and isinstance(dp.value, (int, float)):
+                    rich_data.open_interest[dp.symbol] = dp.value
+        except Exception:
+            pass
+
+    # --- Build universe from available data ---
+    universe = list(set(
+        list(rich_data.raw_prices.keys()) +
+        [m.symbol for m in rich_data.markets]
+    ))
+    # Always include core symbols
+    for core in ["BTC", "ETH", "SOL"]:
+        if core not in universe:
+            universe.append(core)
+    print(f"[{run_id}] Universe: {universe[:15]}")
+
+    report.set_section("B", (
+        f"Core symbols: BTC, ETH, SOL\n\n"
+        f"AI universe: {', '.join(universe[:10])}\n\n"
+        f"Total universe: {len(universe)} symbols | "
+        f"MCP markets: {len(rich_data.markets)} | "
+        f"Prices: {len(rich_data.raw_prices)}"
+    ))
+
+    # Build the prompt regardless (useful for logging even if response is pre-provided)
+    skill_warnings: list[str] = []
+    try:
+        loaded_skills, skill_warnings = skills_mod.load_enabled_skills(PROJECT_ROOT, ai_config)
+    except FileNotFoundError as e:
+        loaded_skills = []
+        skill_warnings = [str(e)]
+        print(f"[{run_id}] WARNING: {e}")
+    active_skills_text = skills_mod.format_skills_for_prompt(loaded_skills)
+
+    prompt = mcp_mod.format_ai_prompt(
+        market_data=rich_data,
+        equity=risk_params.equity,
+        max_open_trades=max_open_trades,
+        max_candidates=max_candidates,
+        prompt_id=run_id,
+        active_skills=active_skills_text,
+        existing_positions=rich_data.account.positions if rich_data.account else [],
+        prior_signal_stats=signal_stats,
+    )
+
+    # Save prompt for Droid/Hermes to use
+    prompt_path = acct / "data" / "ai_prompt.txt"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    print(f"[{run_id}] AI prompt saved to data/ai_prompt.txt ({len(prompt)} chars)")
+
+    ai_response_path = acct / "data" / "ai_response.json"
+    request_path = acct / "data" / "ai_request.json"
+    request_payload = {
+        "prompt_id": run_id,
+        "created_ts_Australia/Sydney": timestamp_aest,
+        "account": account_id,
+        "mode": "ai-paper",
+        "prompt_path": str(prompt_path),
+        "response_path": str(ai_response_path),
+        "required_response_shape": {
+            "prompt_id": run_id,
+            "agent": "hermes|droid",
+            "decision_ts_Australia/Sydney": "YYYY-MM-DD HH:MM:SS Australia/Sydney",
+            "no_trade_reason": "",
+            "trades": [],
+        },
+        "skills_loaded": [s.name for s in loaded_skills],
+        "skill_warnings": skill_warnings,
+    }
+    request_path.write_text(json.dumps(request_payload, indent=2) + "\n", encoding="utf-8")
+    print(f"[{run_id}] AI request metadata saved to data/ai_request.json")
+
+    bridge_status = "not_configured"
+    agent_file_cfg = ai_config.get("ai", {}).get("agent_file", {})
+    bridge_command = str(agent_file_cfg.get("bridge_command", "") or "").strip()
+    if bridge_command:
+        env = os.environ.copy()
+        env.update({
+            "IMPERIAL_AI_PROMPT_PATH": str(prompt_path),
+            "IMPERIAL_AI_REQUEST_PATH": str(request_path),
+            "IMPERIAL_AI_RESPONSE_PATH": str(ai_response_path),
+            "IMPERIAL_AI_PROMPT_ID": run_id,
+        })
+        try:
+            result = subprocess.run(
+                shlex.split(bridge_command),
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            bridge_status = f"exit_{result.returncode}"
+            if result.stdout.strip():
+                print(f"[{run_id}] AI bridge stdout: {result.stdout.strip()[:500]}")
+            if result.stderr.strip():
+                print(f"[{run_id}] AI bridge stderr: {result.stderr.strip()[:500]}")
+        except Exception as e:
+            bridge_status = f"error:{type(e).__name__}:{e}"
+            print(f"[{run_id}] AI bridge failed: {bridge_status}")
+
+    # The AI response can be injected via mission_state._ai_response by a
+    # Droid/Hermes session, or written to data/ai_response.json by an agent/API
+    # bridge. It must echo this run's prompt_id to avoid stale decisions.
+    ai_response_raw = state.get("_ai_response", "")
+    ai_response_source = "mission_state._ai_response" if ai_response_raw else ""
+    if not ai_response_raw and ai_response_path.exists():
+        ai_response_raw = ai_response_path.read_text(encoding="utf-8")
+        ai_response_source = "data/ai_response.json"
+        print(f"[{run_id}] Read AI response from {ai_response_source}")
+
+    # Parse AI response into trade candidates
+    response_accept_reason = "no_response"
+    if ai_response_raw:
+        candidate_json, accepted, response_accept_reason = ai_mod.validate_prompt_bound_response(
+            ai_response_raw, expected_prompt_id=run_id,
+        )
+        if accepted:
+            ai_candidates = ai_mod.parse_ai_response(candidate_json)
+            print(f"[{run_id}] AI response accepted from {ai_response_source}: {len(ai_candidates)} candidates")
+        else:
+            ai_candidates = []
+            print(f"[{run_id}] AI response ignored: {response_accept_reason}")
+    else:
+        ai_candidates = []
+        print(f"[{run_id}] No AI response provided. Prompt is ready for Droid/Hermes delegation.")
+        print(f"[{run_id}] To trade AI account this cycle, write prompt-bound JSON to data/ai_response.json.")
+
+    # Validate candidates
+    for cand in ai_candidates:
+        price = rich_data.raw_prices.get(cand.symbol, cand.entry)
+        # Estimate ATR from price (1.5% proxy) if no real ATR
+        atr_est = price * 0.015
+        ai_mod.validate_candidate(cand, atr=atr_est)
+
+    valid_candidates = [c for c in ai_candidates if c.valid]
+    print(f"[{run_id}] Valid candidates: {len(valid_candidates)}/{len(ai_candidates)}")
+
+    # --- Report Sections ---
+
+    # Section C: Evidence (market data summary)
+    evidence_lines = ["### Market Data (MCP Sources)\n\n"]
+    evidence_lines.append("| Symbol | Price | Funding | OI | Volume 24h |\n")
+    evidence_lines.append("|--------|-------|---------|-----|------------|\n")
+    for sym in sorted(universe[:15]):
+        price = rich_data.raw_prices.get(sym, 0)
+        fr = rich_data.funding_rates.get(sym, "N/A")
+        oi = rich_data.open_interest.get(sym, "N/A")
+        vol = rich_data.volume_24h.get(sym, "N/A")
+        fr_str = f"{fr:.6f}" if isinstance(fr, (int, float)) else str(fr)
+        oi_str = f"${oi:,.0f}" if isinstance(oi, (int, float)) else str(oi)
+        vol_str = f"${vol:,.0f}" if isinstance(vol, (int, float)) else str(vol)
+        evidence_lines.append(
+            f"| {sym} | {price:.2f} | {fr_str} | {oi_str} | {vol_str} |\n"
+        )
+    report.set_section("C", "".join(evidence_lines))
+
+    # Section D: On-chain Flow
+    report.set_section("D", (
+        f"### AI Agent Data Sources\n\n"
+        f"*Data from {len(all_datapoints)} DataPoints across MCP tools and Imperial API.*\n\n"
+        f"MCP markets: {len(rich_data.markets)} | "
+        f"Prices: {len(rich_data.raw_prices)} | "
+        f"Funding: {len(rich_data.funding_rates)} | "
+        f"Pool data: {len(rich_data.pool_data)}"
+    ))
+
+    # Section E: AI Reasoning
+    report.set_section("E", ai_mod.build_ai_report_section(ai_candidates))
+
+    # --- Risk Sizing + Paper Order Writing ---
+    final_trades: list[dict[str, Any]] = []
+
+    for cand in valid_candidates[:max_candidates]:
+        if len(final_trades) >= max_open_trades:
+            break
+
+        sym = cand.symbol
+        price = rich_data.raw_prices.get(sym, cand.entry)
+        if price <= 0:
+            price = cand.entry
+
+        best_bid = price * 0.9999
+        best_ask = price * 1.0001
+
+        sizing = risk_mod.compute_risk_sizing(
+            symbol=sym, side=cand.side, entry=cand.entry, stop=cand.stop,
+            params=risk_params, best_bid=best_bid, best_ask=best_ask,
+        )
+
+        if not sizing.valid:
+            risk_mod.write_skipped_trade(
+                csv_path=acct / "ledgers" / "skipped_trades.csv",
+                symbol=sym, side=cand.side.value, reason=sizing.reject_reason,
+                entry=cand.entry, stop=cand.stop,
+            )
+            print(f"[{run_id}]   {sym} {cand.side.value}: REJECTED - {sizing.reject_reason}")
+            continue
+
+        order = sizing.to_paper_order(
+            setup=cand.setup_type, tp1=cand.tp1, tp2=cand.tp2,
+            provenance_tags=f"run={run_id},mode=ai-paper,setup={cand.setup_type},band={cand.probability_band}",
+        )
+        tracker.write_order(order)
+        kg.add(subject=sym, predicate="has_order", object_=run_id,
+               attrs={"side": cand.side.value, "entry": cand.entry, "stop": cand.stop,
+                       "setup": cand.setup_type, "rationale": cand.rationale},
+               source_name="AI-Agent")
+
+        final_trades.append({
+            "symbol": sym, "side": cand.side.value, "setup": cand.setup_type,
+            "entry": cand.entry, "stop": cand.stop, "tp1": cand.tp1, "tp2": cand.tp2,
+            "qty": sizing.qty, "notional": sizing.notional, "leverage": sizing.leverage,
+            "risk_usd": sizing.risk_usd,
+            "rationale": cand.rationale, "probability_band": cand.probability_band,
+        })
+        print(f"[{run_id}]   {sym} {cand.side.value}: order written, ${sizing.notional:.2f} @ {sizing.leverage:.1f}x")
+
+    kg.flush()
+
+    # Determine status
+    status = "paper_candidate" if final_trades else "no_trade"
+
+    # Section F: Final Paper Trades
+    if final_trades:
+        trade_lines = []
+        for t in final_trades:
+            trade_lines.append(
+                f"**{t['symbol']} {t['side'].upper()}**\n"
+                f"- Setup: {t['setup']} ({t.get('probability_band', 'N/A')} confidence)\n"
+                f"- Entry: {t['entry']:.2f} | Stop: {t['stop']:.2f}\n"
+                f"- TP1: {t['tp1']:.2f} | TP2: {t['tp2']:.2f}\n"
+                f"- Qty: {t['qty']:.4f} | Notional: ${t['notional']:.2f}\n"
+                f"- Leverage: {t['leverage']:.1f}x | Risk: ${t['risk_usd']:.2f}\n"
+                f"- Rationale: {t.get('rationale', 'N/A')}\n"
+            )
+        report.set_section("F", "\n".join(trade_lines))
+    else:
+        if not ai_candidates:
+            no_trade_reason = f"no accepted AI candidates ({response_accept_reason})"
+        elif not valid_candidates:
+            no_trade_reason = f"all {len(ai_candidates)} AI candidates failed validation"
+        else:
+            no_trade_reason = "all risk sizings were invalid"
+        report.set_section("F", (
+            f"No paper trades generated. Status: `{status}`.\n\n"
+            f"Reason: {no_trade_reason}.\n\n"
+            f"AI candidates: {len(ai_candidates)}, Valid: {len(valid_candidates)}."
+        ))
+
+    # Section G: X Post Draft
+    report.set_section("G", "No X post draft (AI paper scan mode). NFA/DYOR.")
+
+    # Section H: Assumptions and Gaps
+    report.set_section("H", (
+        "### Assumptions\n"
+        "- Market data from Flash Trade + Phantom MCP tools, with Imperial API fallback\n"
+        "- AI reasoning produces trade decisions (replaces deterministic signal scoring)\n"
+        "- Risk sizing, cancel rules, and outcome evaluation remain deterministic\n"
+        "- Signal weights in scoring.py are NOT used (AI decides independently)\n\n"
+        "### Gaps\n"
+        "- MCP tools require Droid/Hermes agent data injection or Imperial API fallback\n"
+        "- AI response must be prompt-bound via mission_state._ai_response or data/ai_response.json\n"
+        "- No real OHLC candles (flat mark-price approximation for ATR)\n"
+        "- Catalyst signal always unknown\n"
+        f"- Skills loaded: {', '.join([s.name for s in loaded_skills]) or 'none'}\n"
+        f"- Skill warnings: {', '.join(skill_warnings) if skill_warnings else 'none'}\n"
+        f"- AI bridge status: {bridge_status}\n"
+        f"- AI response status: {response_accept_reason}"
+    ))
+
+    # Section I: Citations
+    sources_used = set()
+    for dp in all_datapoints:
+        sources_used.add(dp.provenance.source_name)
+    sources_str = ", ".join(sorted(sources_used)) if sources_used else "AI-Agent (MCP)"
+    report.set_section("I", (
+        f"Sources used: {sources_str}\n\n"
+        f"All data fetched at {timestamp_aest}"
+    ))
+
+    # Section J: OutcomeGraph CSV
+    report.set_section("J", (
+        "```csv\n"
+        "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
+        "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
+        "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags\n"
+        "```\n\n"
+        f"Paper orders written: {len(final_trades)}"
+    ))
+
+    # Section K: Audit
+    report.set_section("K", (
+        "| Metric | Score |\n|--------|-------|\n"
+        f"| Mode | ai-paper (MCP + AI reasoning) |\n"
+        f"| MCP data points | {len(all_datapoints)} |\n"
+        f"| MCP markets | {len(rich_data.markets)} |\n"
+        f"| AI candidates | {len(ai_candidates)} |\n"
+        f"| Valid candidates | {len(valid_candidates)} |\n"
+        f"| Paper trades | {len(final_trades)} |\n"
+        f"| Skills loaded | {len(loaded_skills)} |\n"
+        f"| AI bridge | {bridge_status} |\n"
+        f"| Response status | {response_accept_reason} |\n"
+        f"| Risk sizing | deterministic (risk.py) |\n"
+        f"| Top failure mode | {'none' if final_trades else 'no_valid_ai_candidates'} |"
+    ))
+
+    # Write report
+    report_path = report.write(status=status)
+
+    # Update mission state
+    state["last_run_id"] = run_id
+    state["last_ai_prompt_path"] = str(prompt_path)
+    new_trade_orders = [
+        {
+            "symbol": t["symbol"],
+            "side": t["side"],
+            "setup": t["setup"],
+            "entry": t["entry"],
+            "stop": t["stop"],
+            "tp1": t["tp1"],
+            "tp2": t["tp2"],
+            "qty": t["qty"],
+            "notional": t["notional"],
+            "leverage": t["leverage"],
+            "created_ts_aest": tracker.read_orders()[-1].created_ts_aest if tracker.read_orders() else aest_now_iso(),
+            "fees_bps": 5.0,
+            "slippage_bps": 3.0,
+            "provenance_tags": f"run={run_id},mode=ai-paper",
+            "signals": [t["setup"]],
+        }
+        for t in final_trades
+    ]
+    state["open_paper_orders"] = open_orders + new_trade_orders
+    # Clear one-shot AI response
+    state.pop("_ai_response", None)
+    _save_mission_state(state, account_id)
+
+    print(f"[{run_id}] Status: {status}")
+    print(f"[{run_id}] Paper trades: {len(final_trades)}")
+    print(f"[{run_id}] Report: {report_path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Imperial Agent Run Scan")
     parser.add_argument(
         "--mode",
-        choices=["plumbing-dry-run", "live-paper", "evaluate-outcomes"],
+        choices=["plumbing-dry-run", "live-paper", "evaluate-outcomes", "ai-paper"],
         default="plumbing-dry-run",
         help="Run mode",
     )
+    parser.add_argument(
+        "--account",
+        default=None,
+        help="Account ID for isolated ledgers/reports (default: 'deterministic' for live-paper, 'ai' for ai-paper)",
+    )
     args = parser.parse_args()
 
+    # Default account IDs by mode
+    account = args.account
+    if account is None:
+        if args.mode == "ai-paper":
+            account = "ai"
+        else:
+            account = "deterministic"
+
     if args.mode == "plumbing-dry-run":
-        return _run_plumbing_dry_run()
+        return _run_plumbing_dry_run(account)
     elif args.mode == "live-paper":
-        return _run_live_paper()
+        return _run_live_paper(account)
     elif args.mode == "evaluate-outcomes":
-        return _run_evaluate_outcomes()
+        return _run_evaluate_outcomes(account_id=account)
+    elif args.mode == "ai-paper":
+        return _run_ai_paper(account)
     else:
         print(f"Unknown mode: {args.mode}", file=sys.stderr)
         return 1

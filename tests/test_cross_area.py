@@ -106,19 +106,24 @@ def _make_active_signals(direction: float = 1.0) -> dict:
 
 
 def _setup_eval_env(tmp_path: Path, orders: list[dict]) -> Path:
-    """Create a temporary directory structure for evaluate-outcomes testing."""
-    (tmp_path / "memory").mkdir(parents=True)
-    (tmp_path / "ledgers").mkdir(parents=True)
+    """Create a temporary directory structure for evaluate-outcomes testing.
+
+    Returns the account path (tmp_path/accounts/deterministic/) which can be
+    passed as base_path to _run_evaluate_outcomes.
+    """
+    acct = tmp_path / "accounts" / "deterministic"
+    (acct / "memory").mkdir(parents=True)
+    (acct / "ledgers").mkdir(parents=True)
 
     state = {
         "mode": "live-paper-only",
         "last_run_id": "run_20260601T120000_AEST",
         "open_paper_orders": orders,
     }
-    (tmp_path / "memory" / "mission_state.json").write_text(
+    (acct / "memory" / "mission_state.json").write_text(
         json.dumps(state, indent=2) + "\n"
     )
-    return tmp_path
+    return acct
 
 
 def _make_eval_order(
@@ -553,28 +558,30 @@ class TestFullScanLoopEndToEnd:
         mock_imperial.fetch_gmtrade_funding_rates.return_value = []
         mock_imperial.fetch_phoenix_depth.return_value = []
 
-        # Setup temp directory structure
-        (tmp_path / "reports").mkdir(parents=True)
-        (tmp_path / "ledgers").mkdir(parents=True)
-        (tmp_path / "memory").mkdir(parents=True)
+        # Setup temp directory structure — account subdirectories
+        acct_path = tmp_path / "accounts" / "deterministic"
+        (acct_path / "reports").mkdir(parents=True)
+        (acct_path / "ledgers").mkdir(parents=True)
+        (acct_path / "memory").mkdir(parents=True)
+        (acct_path / "data").mkdir(parents=True)
         (tmp_path / "data" / "raw").mkdir(parents=True)
 
         # Initialize CSV files
-        (tmp_path / "ledgers" / "paper_orders.csv").write_text(
+        (acct_path / "ledgers" / "paper_orders.csv").write_text(
             "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
             "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
             "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags\n"
         )
-        (tmp_path / "ledgers" / "kg_triples.csv").write_text("")
-        (tmp_path / "ledgers" / "outcomes.csv").write_text("")
-        (tmp_path / "ledgers" / "signal_outcomes.csv").write_text("")
+        (acct_path / "ledgers" / "kg_triples.csv").write_text("")
+        (acct_path / "ledgers" / "outcomes.csv").write_text("")
+        (acct_path / "ledgers" / "signal_outcomes.csv").write_text("")
 
         state = {
             "mode": "live-paper-only",
             "last_run_id": "",
             "open_paper_orders": [],
         }
-        (tmp_path / "memory" / "mission_state.json").write_text(
+        (acct_path / "memory" / "mission_state.json").write_text(
             json.dumps(state, indent=2) + "\n"
         )
 
@@ -598,11 +605,11 @@ class TestFullScanLoopEndToEnd:
 
         assert result == 0, "Scan should complete without error"
 
-        # Verify artifacts
-        reports = list((tmp_path / "reports").glob("*_report.md"))
+        # Verify artifacts in account directory
+        reports = list((acct_path / "reports").glob("*_report.md"))
         assert len(reports) >= 1, "Report should be generated"
 
-        state_after = json.loads((tmp_path / "memory" / "mission_state.json").read_text())
+        state_after = json.loads((acct_path / "memory" / "mission_state.json").read_text())
         assert state_after["last_run_id"].startswith("run_"), "last_run_id should be set"
         assert state_after["mode"] == "live-paper-only", "Mode should not change"
 
@@ -742,17 +749,19 @@ class TestMissionStateProvenanceKG:
         import shutil
         import engine.run_scan as run_scan_mod
 
-        # Setup
-        (tmp_path / "reports").mkdir(parents=True)
-        (tmp_path / "ledgers").mkdir(parents=True)
-        (tmp_path / "memory").mkdir(parents=True)
+        # Setup — account subdirectory
+        acct = tmp_path / "accounts" / "deterministic"
+        (acct / "reports").mkdir(parents=True)
+        (acct / "ledgers").mkdir(parents=True)
+        (acct / "memory").mkdir(parents=True)
+        (acct / "data").mkdir(parents=True)
         (tmp_path / "data" / "raw").mkdir(parents=True)
 
         for f in ["paper_orders.csv", "kg_triples.csv", "outcomes.csv", "signal_outcomes.csv", "skipped_trades.csv"]:
-            (tmp_path / "ledgers" / f).write_text("")
+            (acct / "ledgers" / f).write_text("")
 
         state = {"mode": "live-paper-only", "last_run_id": "", "open_paper_orders": []}
-        (tmp_path / "memory" / "mission_state.json").write_text(json.dumps(state, indent=2))
+        (acct / "memory" / "mission_state.json").write_text(json.dumps(state, indent=2))
 
         src_config = Path("/home/kt/imperial-agent/config")
         if src_config.exists():
@@ -776,7 +785,7 @@ class TestMissionStateProvenanceKG:
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             run_scan_mod._run_live_paper()
 
-        state_after = json.loads((tmp_path / "memory" / "mission_state.json").read_text())
+        state_after = json.loads((acct / "memory" / "mission_state.json").read_text())
         assert state_after["last_run_id"] != "", "last_run_id should be updated"
         assert state_after["last_run_id"].startswith("run_"), "Should match run_YYYYMMDDTHHMMSS_AEST pattern"
         assert state_after["mode"] == "live-paper-only", "Mode must not change"

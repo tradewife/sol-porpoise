@@ -32,6 +32,15 @@ Thumbs.db
 # Generated reports (ephemeral, timestamped)
 reports/*.md
 
+# Account runtime data (ledgers, memory, reports, data — generated each cycle)
+accounts/*/ledgers/
+accounts/*/memory/
+accounts/*/reports/
+accounts/*/data/
+# Keep the directory structure
+!accounts/.gitkeep
+!accounts/*/.gitkeep
+
 # Distribution
 dist/
 build/

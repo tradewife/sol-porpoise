@@ -242,6 +242,7 @@ def run_dashboard(
     *,
     reports_dir: str = "reports",
     ledger_dir: str = "ledgers",
+    account_id: str | None = None,
 ) -> str:
     """Run the trial dashboard and return formatted summary string.
 
@@ -254,6 +255,9 @@ def run_dashboard(
         Relative path to reports directory from project root.
     ledger_dir : str
         Relative path to ledgers directory from project root.
+    account_id : str or None
+        If provided, read from accounts/<account_id>/ instead of the
+        top-level reports/ and ledgers/ directories.
 
     Returns
     -------
@@ -265,8 +269,13 @@ def run_dashboard(
     else:
         project_root = Path(project_root)
 
-    reports_path = project_root / reports_dir
-    ledger_path = project_root / ledger_dir
+    if account_id:
+        base = project_root / "accounts" / account_id
+        reports_path = base / reports_dir
+        ledger_path = base / ledger_dir
+    else:
+        reports_path = project_root / reports_dir
+        ledger_path = project_root / ledger_dir
 
     # Gather data
     scan_count = _count_scans(reports_path)
@@ -356,9 +365,30 @@ def run_dashboard(
 
 
 def main() -> None:
-    """CLI entry point — print dashboard to stdout."""
-    output = run_dashboard()
-    print(output)
+    """CLI entry point — print dashboard to stdout.
+
+    Usage:
+        python -m engine.trial_dashboard                  # legacy top-level
+        python -m engine.trial_dashboard --account ai     # AI account
+        python -m engine.trial_dashboard --account deterministic  # deterministic account
+        python -m engine.trial_dashboard --all            # show both accounts side by side
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description="Imperial Trial Dashboard")
+    parser.add_argument("--account", default=None, help="Account ID (e.g., 'ai', 'deterministic')")
+    parser.add_argument("--all", action="store_true", help="Show all accounts")
+    args = parser.parse_args()
+
+    if args.all:
+        for acct_id in ("deterministic", "ai"):
+            print(f"\n{'=' * 60}")
+            print(f"  ACCOUNT: {acct_id.upper()}")
+            print(f"{'=' * 60}")
+            output = run_dashboard(account_id=acct_id)
+            print(output)
+    else:
+        output = run_dashboard(account_id=args.account)
+        print(output)
 
 
 if __name__ == "__main__":

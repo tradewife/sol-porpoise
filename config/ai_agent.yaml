@@ -1,0 +1,102 @@
+# ai_agent.yaml — Configuration for the AI agent paper trading mode.
+#
+# Controls which MCP data sources to use, how the AI reasons about trades,
+# and safety constraints.
+
+# ---------------------------------------------------------------------------
+# Mode
+# ---------------------------------------------------------------------------
+# When ai-paper mode is active, the agent uses AI reasoning via MCP tools
+# instead of deterministic signal scoring.
+# This file is informational — actual mode is set via --mode ai-paper.
+
+# ---------------------------------------------------------------------------
+# MCP Data Sources
+# ---------------------------------------------------------------------------
+mcp:
+  # Flash Trade MCP: market prices, pool data, trading overview
+  flash_trade:
+    enabled: true
+    tools:
+      - get_trading_overview    # Prices, leverage, pool util for all markets
+      - get_prices              # Oracle prices from Pyth Lazer
+      - get_pool_data           # AUM, LP stats, custody ratios
+    primary_for: [prices, leverage, pool_utilization]
+
+  # Phantom MCP: perps positions, account balance, HL markets
+  phantom:
+    enabled: true
+    tools:
+      - perps_account           # Account balance (USDC)
+      - perps_positions         # Open positions with PnL
+      - perps_markets           # HL market data (funding, OI, volume)
+    primary_for: [positions, funding, open_interest, volume]
+
+# ---------------------------------------------------------------------------
+# AI Reasoning
+# ---------------------------------------------------------------------------
+ai:
+  # How the AI receives market data and produces decisions.
+  # "prompt" mode: builds a structured prompt, AI responds with JSON.
+  prompt_template: "default"
+  # Response provider for automated cron operation.
+  # Droid and Hermes are agent/API delegates, not local models. The repo
+  # therefore uses a prompt-bound file handoff by default:
+  #   1. ai-paper writes accounts/ai/data/ai_prompt.txt + ai_request.json
+  #   2. Droid or Hermes writes accounts/ai/data/ai_response.json
+  #   3. ai-paper only accepts the response if prompt_id matches
+  response_provider: "agent_file"
+  agent_file:
+    enabled: true
+    preferred_agents: ["hermes", "droid"]
+    prompt_path: "accounts/ai/data/ai_prompt.txt"
+    request_path: "accounts/ai/data/ai_request.json"
+    response_path: "accounts/ai/data/ai_response.json"
+    # Optional command invoked after prompt/request files are written.
+    # The command receives paths via environment variables:
+    # IMPERIAL_AI_PROMPT_PATH, IMPERIAL_AI_REQUEST_PATH,
+    # IMPERIAL_AI_RESPONSE_PATH, IMPERIAL_AI_PROMPT_ID.
+    # Default stub is safe and produces no response until wired to Hermes/Droid.
+    bridge_command: "./scripts/ai_delegate_agent.sh"
+    stale_response_policy: "ignore"
+  # Maximum number of trade candidates the AI should produce per scan.
+  max_candidates: 3
+  # Minimum probability band for a candidate to be considered.
+  # "low" = accept all; "medium" = skip low-confidence; "high" = skip medium and low.
+  min_probability_band: "low"
+
+# ---------------------------------------------------------------------------
+# Repo-local Skills
+# ---------------------------------------------------------------------------
+skills:
+  enabled:
+    - core-trader-mandate
+    - hyperliquid-microstructure
+    - solana-perps-context
+    - whale-leaderboard-intel
+    - risk-execution-rails
+    - provenance-auditor
+    - outcome-learning
+  max_chars_per_skill: 2500
+  fail_on_missing_core_skill: true
+
+# ---------------------------------------------------------------------------
+# Safety (must match risk.yaml)
+# ---------------------------------------------------------------------------
+safety:
+  # These are enforced by risk.py regardless of AI decisions.
+  # Listed here for prompt construction only.
+  equity_usd: 1000
+  max_risk_pct: 0.20
+  leverage_min: 9
+  leverage_max: 12
+  max_open_trades: 4
+
+# ---------------------------------------------------------------------------
+# Fallback
+# ---------------------------------------------------------------------------
+fallback:
+  # If MCP tools are unavailable, fall back to Imperial API data.
+  use_imperial_api: true
+  # If AI reasoning fails or returns invalid JSON, skip the cycle (no trades).
+  on_ai_failure: "skip"

@@ -1,0 +1,10 @@
+hawk_breakout:
+  enabled: true
+  lookback_days: 7
+  sm_tilt_min_pct: 55
+  sm_tilt_strong_pct: 70
+  min_score: 5
+  breakout_mag_high: 1.0
+  breakout_mag_mid: 0.3
+  volume_spike_multiplier: 1.5
+  structure_partial_confidence_cap: "medium"

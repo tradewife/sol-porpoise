@@ -1,7 +1,7 @@
 [project]
-name = "imperial-agent"
-version = "0.1.0"
-description = "Live paper-trading alpha agent for Solana perpetual futures via Imperial API"
+name = "sol-porpoise"
+version = "0.2.0"
+description = "Live paper-trading agent for Solana perpetual futures on Phoenix Perps"
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"

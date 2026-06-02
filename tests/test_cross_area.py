@@ -586,7 +586,7 @@ class TestFullScanLoopEndToEnd:
         )
 
         # Copy config files
-        src_config = Path("/home/kt/imperial-agent/config")
+        src_config = Path(__file__).resolve().parent.parent / "config"
         dst_config = tmp_path / "config"
         if src_config.exists():
             shutil.copytree(src_config, dst_config)
@@ -624,19 +624,19 @@ class TestNoRegressions:
 
     def test_no_2_percent_placeholder(self) -> None:
         """stop_pct = 0.02 placeholder must be removed from run_scan.py."""
-        source = Path("/home/kt/imperial-agent/engine/run_scan.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "engine" / "run_scan.py").read_text()
         assert "stop_pct = 0.02" not in source, \
             "2% placeholder should be removed"
 
     def test_extract_signals_imported_in_run_scan(self) -> None:
         """run_scan.py must import and use extract_signals."""
-        source = Path("/home/kt/imperial-agent/engine/run_scan.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "engine" / "run_scan.py").read_text()
         assert "signals_mod.extract_signals" in source or "extract_signals" in source, \
             "extract_signals should be called in run_scan.py"
 
     def test_compute_min_stop_imported_in_run_scan(self) -> None:
         """run_scan.py must use compute_min_stop (via playbooks module)."""
-        source = Path("/home/kt/imperial-agent/engine/run_scan.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "engine" / "run_scan.py").read_text()
         # compute_min_stop is used within playbooks.py; verify playbooks is imported
         assert "playbooks" in source or "generate_playbooks" in source, \
             "Playbooks module should be integrated into run_scan.py"
@@ -646,7 +646,7 @@ class TestNoRegressions:
         import subprocess
         result = subprocess.run(
             [".venv/bin/python", "-m", "engine.run_scan", "--mode", "plumbing-dry-run"],
-            capture_output=True, text=True, cwd="/home/kt/imperial-agent",
+            capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent),
             timeout=30,
         )
         assert result.returncode == 0, f"Dry run failed: {result.stderr}"
@@ -763,7 +763,7 @@ class TestMissionStateProvenanceKG:
         state = {"mode": "live-paper-only", "last_run_id": "", "open_paper_orders": []}
         (acct / "memory" / "mission_state.json").write_text(json.dumps(state, indent=2))
 
-        src_config = Path("/home/kt/imperial-agent/config")
+        src_config = Path(__file__).resolve().parent.parent / "config"
         if src_config.exists():
             shutil.copytree(src_config, tmp_path / "config")
 
@@ -838,7 +838,7 @@ class TestReportSectionHGaps:
 
     def test_section_h_no_stale_atr_gap(self) -> None:
         """Section H should NOT list ATR/stop placeholder as a gap."""
-        source = Path("/home/kt/imperial-agent/engine/run_scan.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "engine" / "run_scan.py").read_text()
         # Find section H content
         assert "ATR-based" in source or "compute_min_stop" in source, \
             "Section H should reflect ATR-based stops"
@@ -848,13 +848,13 @@ class TestReportSectionHGaps:
 
     def test_section_h_no_stale_signals_gap(self) -> None:
         """Section H should NOT list 'signals mostly unknown' as a gap."""
-        source = Path("/home/kt/imperial-agent/engine/run_scan.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "engine" / "run_scan.py").read_text()
         assert "Signal extraction: 9 components via extract_signals" in source, \
             "Section H should reflect real signal extraction, not unknown placeholder"
 
     def test_section_h_lists_remaining_catalyst_gap(self) -> None:
         """Section H should list catalyst as remaining gap."""
-        source = Path("/home/kt/imperial-agent/engine/run_scan.py").read_text()
+        source = (Path(__file__).resolve().parent.parent / "engine" / "run_scan.py").read_text()
         assert "Catalyst" in source or "catalyst" in source, \
             "Section H should mention catalyst as a remaining gap"
 

@@ -1,1 +1,1 @@
-"""Unit tests for imperial-agent."""
+"""Unit tests for sol-porpoise."""

@@ -211,13 +211,13 @@ def format_ai_prompt(
     All numbers in the prompt are from live data -- no hardcoded examples.
     """
     lines = [
-        "# Imperial AI Agent — Paper Trade Decision",
+        "# Sol Porpoise AI Agent — Paper Trade Decision",
         "",
         f"Prompt ID: {prompt_id or 'unknown'}",
         f"Timestamp_Australia/Sydney: {datetime.now(AEST).strftime('%Y-%m-%d %H:%M:%S Australia/Sydney')}",
         "",
         "## Mission Posture",
-        "You are the external AI decision delegate for the Imperial live-paper account.",
+        "You are the external AI decision delegate for the Sol Porpoise live-paper account.",
         "Act with the urgency and selectivity of an elite crypto perps trader, but obey hard paper-trading rails.",
         "Output actionable trade JSON only when the live evidence supports it. Return no trades when evidence is weak.",
         "Never invent data, never use historical simulated trades as outcomes, and never suggest live execution.",

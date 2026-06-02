@@ -1,19 +1,20 @@
 # Agent Instructions
 
-This repository is the build target for the Imperial live-paper trading agent.
+This repository is **Sol Porpoise** -- a live-paper crypto perps trading agent executing on Phoenix Perps via Vulcan.
 
 ## Required Orientation
 
 Before making changes, read:
 
-1. `MISSION.md` — current mission spec (24-hour live-paper trial)
-2. `README.md` — project overview and quick commands
-3. `config/run.yaml` — schedule, equity, and run parameters
-4. `config/risk.yaml` — risk limits, cancel rules, leverage bounds
+1. `README.md` -- project overview, architecture, quick commands
+2. `config/run.yaml` -- schedule, equity, and run parameters
+3. `config/risk.yaml` -- risk limits, cancel rules, leverage bounds
+4. `config/ai_agent.yaml` -- AI agent config, skills, bridge settings
 
 ## Operating Mode
 
 - Default mode is `live-paper-only`.
+- Paper trades execute on Phoenix Perps via Vulcan with real market prices.
 - Do not place live orders.
 - Do not sign transactions.
 - Do not move funds.
@@ -21,50 +22,44 @@ Before making changes, read:
 - Do not create historical simulated trades and count them as paper results.
 - Paper trades must be generated from live market snapshots before outcomes occur.
 
-## Current Mission: 24-Hour Live-Paper Trial
+## Architecture Overview
 
-The agent is configured for hourly paper trading to accumulate performance data over 24 cycles.
+Two parallel accounts run hourly via `cron_hourly.sh`:
 
-### Key Parameters
+- **Deterministic** (`accounts/deterministic/`) -- 14-step scan: data fetch -> 9 signals -> scoring -> playbooks -> risk sizing -> Vulcan execution
+- **AI** (`accounts/ai/`) -- data fetch -> prompt + skills -> `droid exec` (GLM-5.1) -> validate prompt-bound response -> risk sizing -> Vulcan execution
 
-- **Equity**: 1000 USDC
-- **Max concurrent trades**: 4
-- **Max candidates per scan**: 3
-- **Cancel timeout**: 45 minutes (matches hourly cycle)
-- **No 22:00 hard exit** (not applicable to hourly schedule)
-- **Schedule**: Hourly, every hour on the hour (`0 * * * *`)
+Both fall back to synthetic paper_orders.csv when Vulcan is unavailable.
 
-### Learning Observer, Not Timid Trader
+### Vulcan Execution
 
-The agent reads signal outcome stats to learn which signals perform well, but this learning is **informational only**:
+When `vulcan` CLI is installed, trades execute via `adapters/vulcan.py`:
+- Paper state files at `accounts/<id>/data/vulcan-paper-state.json` (isolated per account)
+- Market fills at real Phoenix prices with real fees
+- TP/SL triggers persist across sessions
+- Duplicate position prevention (same symbol check)
+
+### AI Agent Bridge
+
+`scripts/ai_delegate_agent.sh` calls `droid exec` with:
+- Model: `custom:GLM-5.1-[Z.AI-Coding-Plan]---Openai-0`
+- Reasoning: high
+- Reads prompt file, outputs JSON response
+- Response must include matching `prompt_id`
+
+### Trading Skills
+
+7 repo-local skills loaded at runtime from `skills/<name>/SKILL.md`. Add new skills by creating the SKILL.md and listing in `config/ai_agent.yaml` under `skills.enabled`.
+
+## Learning Observer, Not Timid Trader
+
 - Signal weights in `scoring.py` are FIXED and must never be adjusted by outcomes.
 - Position sizing must never be reduced due to prior losses.
 - Every scan treats the opportunity fresh with full aggression.
 - Prior outcomes are logged and reported but do not affect conviction or sizing.
 
-### Auto-Evaluate Before Each Scan
-
-Before placing new orders, the scan loop evaluates any open orders from the previous hour:
-- Fetches current mark prices for open orders
-- Evaluates fill status via `evaluate_fill()`
-- Computes outcomes (R, MAE, MFE) for closed orders
-- Writes to `outcomes.csv` and `signal_outcomes.csv`
-- Updates `mission_state.json`
-
-This runs inline at the start of `_run_live_paper()`, not as a separate mode.
-
-## Build Priorities
-
-1. Config updates for hourly trial (run.yaml, risk.yaml)
-2. Auto-evaluate step in scan loop
-3. Cron and trial management scripts
-4. Trial dashboard for real-time monitoring
-5. Signal learning output in reports
-6. Trial stop + final assessment
-
 ## Safety
 
 Any live trading, wallet access, signing path, leverage increase, paid API spend, or weakening of risk controls requires explicit human approval.
 
-Cron installation requires explicit human approval — never auto-install cron entries.
-
+Cron installation requires explicit human approval -- never auto-install cron entries.

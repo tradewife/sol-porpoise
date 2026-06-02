@@ -1759,7 +1759,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Imperial Agent Run Scan")
+    parser = argparse.ArgumentParser(description="Sol Porpoise Run Scan")
     parser.add_argument(
         "--mode",
         choices=["plumbing-dry-run", "live-paper", "evaluate-outcomes", "ai-paper"],

@@ -1,7 +1,7 @@
 #!/bin/bash
 # trial_stop.sh — Stop the 24-hour live-paper trial and produce final summary.
 #
-# 1. Removes cron entry for imperial-agent
+# 1. Removes cron entry for sol-porpoise
 # 2. Runs final evaluate-outcomes for any remaining open orders
 # 3. Runs weekly review on trial data
 # 4. Restores original config from data/trial_config_backup/
@@ -27,11 +27,11 @@ echo ""
 
 # Step 1: Remove cron entry
 echo "Step 1: Removing cron entry"
-if crontab -l 2>/dev/null | grep -q "imperial-agent"; then
-    crontab -l 2>/dev/null | grep -v "imperial-agent" | crontab -
+if crontab -l 2>/dev/null | grep -q "sol-porpoise"; then
+    crontab -l 2>/dev/null | grep -v "sol-porpoise" | crontab -
     echo "  Cron entry removed"
 else
-    echo "  No imperial-agent cron entry found (already removed or never installed)"
+    echo "  No sol-porpoise cron entry found (already removed or never installed)"
 fi
 echo ""
 

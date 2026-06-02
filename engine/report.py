@@ -53,7 +53,7 @@ class ReportWriter:
 
     def _build_report(self, status: str) -> str:
         lines: list[str] = []
-        lines.append(f"# Imperial Agent Run Report")
+        lines.append(f"# Sol Porpoise Run Report")
         lines.append("")
         lines.append(f"- **Run ID**: {self.run_id}")
         lines.append(f"- **Timestamp**: {self.timestamp_aest}")

@@ -45,3 +45,4 @@ accounts/*/data/
 dist/
 build/
 *.egg-info/
+archive/

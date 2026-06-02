@@ -58,6 +58,8 @@ ai:
     # IMPERIAL_AI_RESPONSE_PATH, IMPERIAL_AI_PROMPT_ID.
     # Default stub is safe and produces no response until wired to Hermes/Droid.
     bridge_command: "./scripts/ai_delegate_agent.sh"
+    bridge_model: "custom:GLM-5.1-[Z.AI-Coding-Plan]---Openai-0"
+    bridge_reasoning_effort: "high"
     stale_response_policy: "ignore"
   # Maximum number of trade candidates the AI should produce per scan.
   max_candidates: 3

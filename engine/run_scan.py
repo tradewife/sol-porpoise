@@ -1359,7 +1359,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=300,
             )
             bridge_status = f"exit_{result.returncode}"
             if result.stdout.strip():

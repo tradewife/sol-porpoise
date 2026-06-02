@@ -6,7 +6,7 @@ Live-paper crypto trading agent for Solana perpetual futures. Two parallel paper
 
 **Mode: `live-paper-only`** -- no live trading, no signing, no fund movement.
 
-**595 tests pass.** A cron job fires every hour on the hour, running two independent paper trading accounts in parallel on Phoenix Perps:
+**637 tests pass.** A cron job fires every hour on the hour, running two independent paper trading accounts in parallel on Phoenix Perps:
 
 1. **Deterministic account** (`accounts/deterministic/`) -- 14-step scan loop with fixed signal weights, 9 signal extractors, 7 playbook types. Executes paper trades via Vulcan on Phoenix.
 2. **AI account** (`accounts/ai/`) -- AI reasoning via repo-local skills + Droid/Hermes agent delegation (GLM-5.1). Builds enriched prompt, calls `droid exec`, validates prompt-bound response, executes via Vulcan. Falls closed to no-trade when no agent response.
@@ -50,6 +50,7 @@ Compare both accounts: `python -m engine.trial_dashboard --all`
 - `run.yaml` -- mode, hourly schedule, 1000 USDC equity, max 4 concurrent, max 3 candidates
 - `risk.yaml` -- equity 1000, max risk 20%, leverage 9-12x, 45-min cancel timeout
 - `ai_agent.yaml` -- MCP sources, agent_file response provider, skills config, bridge command (droid exec + GLM-5.1)
+- `strategy.yaml` -- hawk breakout parameters (lookback, SM tilt thresholds, scoring, volume multiplier)
 - `venues.yaml` -- Imperial API + Solana perp venues (Jupiter, Flash Trade, Phoenix, GM Trade)
 
 ### Engine -- Deterministic Pipeline (`engine/`)
@@ -59,16 +60,19 @@ Compare both accounts: `python -m engine.trial_dashboard --all`
 - `risk.py` -- Position sizing (risk_usd / ATR stop_distance, leverage 9-12x cap)
 
 ### Engine -- AI Pipeline (`engine/`)
-- `mcp_data.py` -- Builds enriched AI prompt from live market data + active skills. Requires prompt-bound JSON response.
+- `hawk_breakout.py` -- Deterministic 7-day breakout signal with Smart Money tilt gating and 0-9 scoring (Senpi Hawk v1.0.0). Runs in ai-paper mode only.
+- `mcp_data.py` -- Builds enriched AI prompt from live market data + active skills. Includes hawk signals section (extract_sm_tilt, format_hawk_prompt_section). Requires prompt-bound JSON response.
 - `ai_agent.py` -- Parses AI responses, validates prompt_id binding, validates candidates (stop side, R:R >= 2, ATR floor, evidence/risk_notes/data_gaps)
 - `skills.py` -- Loads repo-local trading skills from `skills/<name>/SKILL.md`
-- `run_scan.py` -- 4 modes: `plumbing-dry-run`, `live-paper`, `evaluate-outcomes`, `ai-paper`. Both trading modes try Vulcan first, fall back to synthetic.
+- `run_scan.py` -- 4 modes: `plumbing-dry-run`, `live-paper`, `evaluate-outcomes`, `ai-paper`. Computes hawk breakout signals before prompt building in ai-paper mode. Both trading modes try Vulcan first, fall back to synthetic.
 
 ### AI Trading Skills (`skills/`)
-Expandable prompt modules controlled by `config/ai_agent.yaml`. Add new skills as `skills/<name>/SKILL.md`.
+Expandable prompt modules controlled by `config/ai_agent.yaml`. Add new skills as `skills/<name>/SKILL.md`. Currently 10 skills enabled:
 
 - `core-trader-mandate` -- Elite perps trader posture, urgency + selectivity, no invented data
 - `hyperliquid-microstructure` -- Funding stretch, OI expansion/contraction, setup patterns
+- `market-structure-context` -- HTF regime classification, alignment scoring, setup type selection, evidence tagging. Gates breakouts through structureConfirmed/partial/rejected lens.
+- `hawk-breakout` -- Interprets pre-computed Hawk breakout signals (Senpi Hawk v1.0.0). 7-day high/low breakout + SM tilt gate + 0-9 scoring. AI-readable signal interpretation and hard veto rules.
 - `solana-perps-context` -- Solana-native venue data, pool utilization, SOL beta behavior
 - `whale-leaderboard-intel` -- Whale classification, no copy-trade, multi-source overlap
 - `risk-execution-rails` -- Hard constraints: equity, risk %, leverage, R:R minimums
@@ -82,7 +86,7 @@ Expandable prompt modules controlled by `config/ai_agent.yaml`. Add new skills a
 - `run_scan.sh`, `trial_start.sh`, `trial_stop.sh` -- CLI wrappers
 
 ### Tests
-595 tests covering all validation contracts, engine modules, cross-module pipelines, account isolation, AI parsing, MCP data, skills loading, Twitter adapter, and end-to-end trial cycles.
+637 tests covering all validation contracts, engine modules, cross-module pipelines, account isolation, AI parsing, MCP data, skills loading, Twitter adapter, hawk breakout signals, and end-to-end trial cycles.
 
 ## Quick Commands
 
@@ -125,6 +129,7 @@ vulcan paper status -o json
 
 ## What's Not Yet Done
 
+- **Hawk breakout history** -- Signals currently return "none" because only a single mark-price snapshot is available. Needs 168 hourly candle closes (7 days) wired into the hawk gate to produce live breakout signals.
 - **Catalyst signal (deterministic)** -- Kukapay returns `unknown` when unreachable (5% weight, degrades gracefully)
 - **Whale intelligence in production** -- Dextrabot scraping needs live HTML verification
 - **Promotion gates** -- 0/8 passed; requires accumulated paper-trade history

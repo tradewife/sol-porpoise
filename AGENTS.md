@@ -49,7 +49,18 @@ When `vulcan` CLI is installed, trades execute via `adapters/vulcan.py`:
 
 ### Trading Skills
 
-7 repo-local skills loaded at runtime from `skills/<name>/SKILL.md`. Add new skills by creating the SKILL.md and listing in `config/ai_agent.yaml` under `skills.enabled`.
+10 repo-local skills loaded at runtime from `skills/<name>/SKILL.md`. Add new skills by creating the SKILL.md and listing in `config/ai_agent.yaml` under `skills.enabled`.
+
+### Hawk Breakout Integration
+
+The hawk breakout pipeline adds deterministic breakout detection to the AI paper trading path:
+
+- **`engine/hawk_breakout.py`** -- Deterministic 7-day breakout signal with Smart Money tilt gating and 0-9 scoring (Senpi Hawk v1.0.0). Runs in `ai-paper` mode only, before prompt building.
+- **`skills/market-structure-context/SKILL.md`** -- AI skill that teaches the agent to classify HTF regime (trending_up, trending_down, ranging, compression, unknown) from the Market Data table, produce alignment scores, and gate breakouts through structureConfirmed/partial/rejected.
+- **`skills/hawk-breakout/SKILL.md`** -- AI skill that teaches the agent to interpret pre-computed hawk signals in the prompt, including hard veto rules and scoring interpretation.
+- Both skills are listed in `config/ai_agent.yaml` under `skills.enabled` at positions 3 and 4.
+- **`config/strategy.yaml`** -- Holds hawk breakout parameters (lookback, SM tilt thresholds, scoring weights, volume multiplier). The module works without this file via Python defaults.
+- **Current limitation:** Hawk signals currently return "none" because only a single mark-price snapshot is available. The 7-day breakout gate requires 168 hourly candle closes, which are not yet wired in. The gate fails gracefully (no signal produced, no crash).
 
 ## Learning Observer, Not Timid Trader
 

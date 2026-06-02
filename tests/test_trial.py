@@ -957,3 +957,363 @@ class TestManualHourlyCycle:
         )
         assert "last_run_id" in updated_state
         assert updated_state["last_run_id"] != "", "last_run_id must be set after scan"
+
+
+# ===========================================================================
+# VAL-DASH-001 through VAL-DASH-006: Trial Dashboard
+# ===========================================================================
+
+
+def _setup_dashboard_dirs(
+    tmp_path: Path,
+    *,
+    paper_orders_csv: str = "",
+    outcomes_csv: str = "",
+    signal_outcomes_csv: str = "",
+    report_count: int = 0,
+) -> Path:
+    """Create temp directory structure for dashboard tests.
+
+    Returns the tmp_path with reports/, ledgers/ subdirs populated.
+    """
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ledgers_dir = tmp_path / "ledgers"
+    ledgers_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create report files with timestamp naming pattern
+    for i in range(report_count):
+        ts = f"2026-06-02T{i:02d}-{i:02d}-{i:02d}_Australia-Sydney"
+        (reports_dir / f"{ts}_report.md").write_text(f"# Report {i}")
+
+    # Create CSV files if provided
+    if paper_orders_csv:
+        (ledgers_dir / "paper_orders.csv").write_text(paper_orders_csv)
+    if outcomes_csv:
+        (ledgers_dir / "outcomes.csv").write_text(outcomes_csv)
+    if signal_outcomes_csv:
+        (ledgers_dir / "signal_outcomes.csv").write_text(signal_outcomes_csv)
+
+    return tmp_path
+
+
+# Sample CSV fixtures
+PAPER_ORDERS_HEADER = (
+    "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
+    "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
+    "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags"
+)
+
+OUTCOMES_HEADER = PAPER_ORDERS_HEADER
+
+SIGNAL_OUTCOMES_HEADER = "signal,hit_rate,avg_R,n,last_updated_Australia/Sydney"
+
+SAMPLE_PAPER_ORDERS = (
+    PAPER_ORDERS_HEADER + "\n"
+    "2026-06-02,BTC,breakout,long,100000,99000,102000,103000,filled,"
+    "2026-06-02T08:00,2026-06-02T09:00,2.1,2.5,0.3,5,3,,Imperial\n"
+    "2026-06-02,ETH,fade,short,3000,3050,2950,2900,cancelled,"
+    "2026-06-02T08:00,2026-06-02T08:45,-0.2,0.1,0.5,5,3,timeout,Imperial\n"
+    "2026-06-02,SOL,vwap_reclaim,long,150,148,155,160,pending,"
+    ",,,0,0,5,3,,Imperial\n"
+    "2026-06-02,BTC,momentum_continuation,long,101000,100000,103000,105000,filled,"
+    "2026-06-02T10:00,2026-06-02T11:00,-1.0,0.2,1.2,5,3,,Imperial\n"
+    "2026-06-02,ETH,liquidity_sweep,short,3100,3150,3050,3000,pending,"
+    ",,,0,0,5,3,,Imperial\n"
+)
+
+SAMPLE_OUTCOMES = (
+    OUTCOMES_HEADER + "\n"
+    "2026-06-02,BTC,breakout,long,100000,99000,102000,103000,filled,"
+    "2026-06-02T08:00,2026-06-02T09:00,2.1,2.5,0.3,5,3,,Imperial\n"
+    "2026-06-02,ETH,fade,short,3000,3050,2950,2900,cancelled,"
+    "2026-06-02T08:00,2026-06-02T08:45,-0.2,0.1,0.5,5,3,timeout,Imperial\n"
+    "2026-06-02,BTC,momentum_continuation,long,101000,100000,103000,105000,filled,"
+    "2026-06-02T10:00,2026-06-02T11:00,-1.0,0.2,1.2,5,3,,Imperial\n"
+)
+
+SAMPLE_SIGNAL_OUTCOMES = (
+    SIGNAL_OUTCOMES_HEADER + "\n"
+    "funding_stretch,0.62,1.2,8,2026-06-02T10:00\n"
+    "oi_delta,0.45,-0.3,11,2026-06-02T10:00\n"
+    "basis,0.55,0.8,6,2026-06-02T10:00\n"
+)
+
+
+class TestDashboardScanCount:
+    """VAL-DASH-001: Dashboard shows correct scan count."""
+
+    def test_scan_count_with_reports(self, tmp_path: Path) -> None:
+        """Dashboard counts report files in reports/ correctly."""
+        root = _setup_dashboard_dirs(tmp_path, report_count=3)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "Scans completed: 3" in output
+
+    def test_scan_count_zero_reports(self, tmp_path: Path) -> None:
+        """Dashboard shows 0 scans when reports/ is empty."""
+        root = _setup_dashboard_dirs(tmp_path, report_count=0)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "Scans completed: 0" in output
+
+    def test_scan_count_excludes_non_reports(self, tmp_path: Path) -> None:
+        """Dashboard only counts files matching *_report.md pattern."""
+        root = _setup_dashboard_dirs(tmp_path, report_count=2)
+        # Add a non-report file
+        (root / "reports" / "notes.txt").write_text("not a report")
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "Scans completed: 2" in output
+
+    def test_scan_count_missing_reports_dir(self, tmp_path: Path) -> None:
+        """Dashboard shows 0 when reports/ directory doesn't exist."""
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=tmp_path)
+        assert "Scans completed: 0" in output
+
+
+class TestDashboardOrderCounts:
+    """VAL-DASH-002: Dashboard shows correct order counts."""
+
+    def test_order_counts_filled_cancelled_open(self, tmp_path: Path) -> None:
+        """Dashboard correctly counts filled, cancelled, and open orders."""
+        root = _setup_dashboard_dirs(
+            tmp_path,
+            paper_orders_csv=SAMPLE_PAPER_ORDERS,
+            report_count=1,
+        )
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        # 2 filled, 1 cancelled, 2 pending — values are padded in output
+        import re
+        assert re.search(r"Filled:\s+2\b", output), f"Expected 'Filled: 2' in output"
+        assert re.search(r"Cancelled:\s+1\b", output), f"Expected 'Cancelled: 1' in output"
+        assert re.search(r"Open:\s+2\b", output), f"Expected 'Open: 2' in output"
+        assert re.search(r"Total orders:\s+5\b", output), f"Expected 'Total orders: 5' in output"
+
+    def test_order_counts_empty_csv(self, tmp_path: Path) -> None:
+        """Dashboard shows zeros when paper_orders.csv has header only."""
+        root = _setup_dashboard_dirs(
+            tmp_path,
+            paper_orders_csv=PAPER_ORDERS_HEADER + "\n",
+        )
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        import re
+        assert re.search(r"Filled:\s+0\b", output)
+        assert re.search(r"Cancelled:\s+0\b", output)
+        assert re.search(r"Open:\s+0\b", output)
+
+    def test_order_counts_missing_csv(self, tmp_path: Path) -> None:
+        """Dashboard shows zeros when paper_orders.csv doesn't exist."""
+        root = _setup_dashboard_dirs(tmp_path)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        import re
+        assert re.search(r"Filled:\s+0\b", output)
+        assert re.search(r"Cancelled:\s+0\b", output)
+
+
+class TestDashboardOutcomeMetrics:
+    """VAL-DASH-003: Dashboard shows correct outcome metrics."""
+
+    def test_win_loss_expectancy(self, tmp_path: Path) -> None:
+        """Dashboard computes correct win/loss/expectancy from outcomes.csv."""
+        root = _setup_dashboard_dirs(
+            tmp_path,
+            outcomes_csv=SAMPLE_OUTCOMES,
+            report_count=1,
+        )
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        # outcomes: 2.1, -0.2, -1.0 => wins=1, losses=2
+        # expectancy = (2.1 - 0.2 - 1.0) / 3 = 0.9 / 3 = 0.3
+        import re
+        assert re.search(r"Wins:\s+1\b", output), f"Expected 'Wins: 1' in output"
+        assert re.search(r"Losses:\s+2\b", output), f"Expected 'Losses: 2' in output"
+        assert "Expectancy R: 0.30" in output
+
+    def test_all_wins(self, tmp_path: Path) -> None:
+        """Expectancy is positive when all trades win."""
+        outcomes = (
+            OUTCOMES_HEADER + "\n"
+            "2026-06-02,BTC,breakout,long,100000,99000,102000,103000,filled,"
+            "2026-06-02T08:00,2026-06-02T09:00,1.5,2.0,0.2,5,3,,Imperial\n"
+            "2026-06-02,ETH,vwap_reclaim,long,3000,2950,3100,3200,filled,"
+            "2026-06-02T08:00,2026-06-02T09:00,2.0,2.5,0.1,5,3,,Imperial\n"
+        )
+        root = _setup_dashboard_dirs(tmp_path, outcomes_csv=outcomes)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        import re
+        assert re.search(r"Wins:\s+2\b", output)
+        assert re.search(r"Losses:\s+0\b", output)
+        assert "Expectancy R: 1.75" in output
+
+    def test_all_losses(self, tmp_path: Path) -> None:
+        """Expectancy is negative when all trades lose."""
+        outcomes = (
+            OUTCOMES_HEADER + "\n"
+            "2026-06-02,BTC,breakout,long,100000,99000,102000,103000,filled,"
+            "2026-06-02T08:00,2026-06-02T09:00,-1.0,0.2,1.2,5,3,,Imperial\n"
+        )
+        root = _setup_dashboard_dirs(tmp_path, outcomes_csv=outcomes)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        import re
+        assert re.search(r"Wins:\s+0\b", output)
+        assert re.search(r"Losses:\s+1\b", output)
+        assert "Expectancy R: -1.00" in output
+
+
+class TestDashboardEmptyData:
+    """VAL-DASH-004: Dashboard handles empty data gracefully."""
+
+    def test_empty_ledgers_no_crash(self, tmp_path: Path) -> None:
+        """Dashboard runs without crash when no data exists."""
+        root = _setup_dashboard_dirs(tmp_path)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert output  # non-empty output
+        assert "no data yet" in output.lower() or "0" in output
+
+    def test_missing_ledgers_no_crash(self, tmp_path: Path) -> None:
+        """Dashboard runs without crash when ledgers/ dir doesn't exist."""
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=tmp_path)
+        assert output
+        assert "Scans completed: 0" in output
+
+    def test_empty_outcomes_shows_zeros(self, tmp_path: Path) -> None:
+        """Dashboard shows zeros when outcomes.csv has no data rows."""
+        root = _setup_dashboard_dirs(
+            tmp_path,
+            outcomes_csv=OUTCOMES_HEADER + "\n",
+        )
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        import re
+        assert re.search(r"Wins:\s+0\b", output)
+        assert re.search(r"Losses:\s+0\b", output)
+        assert "Expectancy R: 0.00" in output
+
+
+class TestDashboardPerSignalSetupStats:
+    """VAL-DASH-005: Dashboard shows per-signal and per-setup stats."""
+
+    def test_per_signal_hit_rates(self, tmp_path: Path) -> None:
+        """Dashboard reads signal_outcomes.csv and shows per-signal hit rates."""
+        root = _setup_dashboard_dirs(
+            tmp_path,
+            signal_outcomes_csv=SAMPLE_SIGNAL_OUTCOMES,
+            report_count=1,
+        )
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "funding_stretch" in output
+        assert "62%" in output or "0.62" in output
+        assert "oi_delta" in output
+        assert "45%" in output or "0.45" in output
+        assert "basis" in output
+        assert "55%" in output or "0.55" in output
+
+    def test_per_setup_type_stats(self, tmp_path: Path) -> None:
+        """Dashboard shows per-setup-type stats from outcomes."""
+        root = _setup_dashboard_dirs(
+            tmp_path,
+            outcomes_csv=SAMPLE_OUTCOMES,
+            report_count=1,
+        )
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "breakout" in output
+        assert "fade" in output
+        assert "momentum_continuation" in output
+
+    def test_empty_signal_outcomes(self, tmp_path: Path) -> None:
+        """Dashboard shows 'no signal data' when signal_outcomes.csv is empty."""
+        root = _setup_dashboard_dirs(
+            tmp_path,
+            signal_outcomes_csv=SIGNAL_OUTCOMES_HEADER + "\n",
+        )
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "no signal" in output.lower() or "0 signals" in output.lower()
+
+    def test_missing_signal_outcomes_csv(self, tmp_path: Path) -> None:
+        """Dashboard handles missing signal_outcomes.csv gracefully."""
+        root = _setup_dashboard_dirs(tmp_path)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "no signal" in output.lower() or "0 signals" in output.lower()
+
+
+class TestDashboardCLI:
+    """VAL-DASH-006: Dashboard CLI entry point works."""
+
+    def test_cli_entry_point(self, tmp_path: Path) -> None:
+        """python -m engine.trial_dashboard runs without error."""
+        import subprocess
+
+        result = subprocess.run(
+            [".venv/bin/python", "-m", "engine.trial_dashboard"],
+            capture_output=True,
+            text=True,
+            cwd="/home/kt/imperial-agent",
+            timeout=30,
+        )
+        assert result.returncode == 0, (
+            f"CLI failed with:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "Scans completed:" in result.stdout
+
+    def test_cli_produces_formatted_output(self, tmp_path: Path) -> None:
+        """CLI output contains expected sections."""
+        import subprocess
+
+        result = subprocess.run(
+            [".venv/bin/python", "-m", "engine.trial_dashboard"],
+            capture_output=True,
+            text=True,
+            cwd="/home/kt/imperial-agent",
+            timeout=30,
+        )
+        output = result.stdout
+        # Must contain key section headers
+        assert "SCAN SUMMARY" in output or "Scan" in output
+        assert "ORDER" in output or "Order" in output
+        assert "OUTCOME" in output or "Outcome" in output
+
+    def test_run_dashboard_returns_string(self, tmp_path: Path) -> None:
+        """run_dashboard() returns a non-empty string."""
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=tmp_path)
+        assert isinstance(output, str)
+        assert len(output) > 0
+
+    def test_dashboard_trial_time_section(self, tmp_path: Path) -> None:
+        """Dashboard shows trial elapsed/remaining time."""
+        root = _setup_dashboard_dirs(tmp_path, report_count=1)
+        from engine.trial_dashboard import run_dashboard
+
+        output = run_dashboard(project_root=root)
+        assert "Trial" in output or "elapsed" in output.lower() or "time" in output.lower()

@@ -19,6 +19,9 @@ from adapters.base import DataPoint, Provenance, SourceTier
 from adapters.normalizer import aest_now_iso, make_provenance
 from adapters.twitter_news import TwitterResult, format_twitter_prompt_section
 
+# Lazy import to avoid circular dependency; resolved at call time.
+# from engine.hawk_breakout import HawkSignal
+
 AEST = ZoneInfo("Australia/Sydney")
 
 
@@ -126,6 +129,62 @@ def overview_to_datapoints(data: RichMarketData) -> list[DataPoint]:
     return points
 
 
+def extract_sm_tilt(
+    symbol: str,
+    whale_points: list,
+    hl_market: dict | None,
+) -> float | None:
+    """Extract Smart Money long % from HL leaderboard data or whale DataPoints.
+
+    Tries HL leaderboard ratio first (topTraderLongRatio / longRatio in 0-1 range).
+    Falls back to counting whale DataPoint long/short labels for the target symbol.
+    Returns None when no usable data is available.
+    """
+    # Try HL leaderboard ratio first
+    if hl_market:
+        ratio = hl_market.get("topTraderLongRatio") or hl_market.get("longRatio")
+        if ratio is not None:
+            try:
+                return float(ratio) * 100  # 0-1 to 0-100
+            except (TypeError, ValueError):
+                pass
+
+    # Fallback: count whale direction labels
+    longs = sum(
+        1 for dp in whale_points
+        if getattr(dp, "symbol", None) == symbol
+        and "long" in str(getattr(dp, "metric", "")).lower()
+    )
+    shorts = sum(
+        1 for dp in whale_points
+        if getattr(dp, "symbol", None) == symbol
+        and "short" in str(getattr(dp, "metric", "")).lower()
+    )
+    total = longs + shorts
+    if total > 0:
+        return longs / total * 100
+    return None
+
+
+def format_hawk_prompt_section(hawk_signals: list) -> str:
+    """Format a list of HawkSignal objects into a markdown prompt section.
+
+    Returns a section header plus per-signal details, or a no-signals message
+    when the list is empty.
+    """
+    if not hawk_signals:
+        return "## Hawk Breakout Signals\n\nNo signals computed this cycle.\n"
+    lines = ["## Hawk Breakout Signals", ""]
+    for sig in hawk_signals:
+        lines.append(f"### {sig.market}")
+        lines.append(f"- signal: {sig.signal}")
+        lines.append(f"- score: {sig.score}/9")
+        lines.append(f"- basis: {sig.basis}")
+        lines.append(f"- notes: {sig.notes}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def parse_trading_overview(raw: dict[str, Any]) -> list[MarketOverview]:
     """Parse the result of flash-trade___get_trading_overview into MarketOverview list."""
     markets: list[MarketOverview] = []
@@ -206,6 +265,7 @@ def format_ai_prompt(
     existing_positions: list[dict[str, Any]] | None = None,
     prior_signal_stats: list[dict[str, Any]] | None = None,
     twitter_results: list[TwitterResult] | None = None,
+    hawk_signals: list | None = None,
 ) -> str:
     """Build the AI reasoning prompt from aggregated market data.
 
@@ -232,6 +292,10 @@ def format_ai_prompt(
     # Twitter CT Intel — AI agent only
     if twitter_results is not None:
         lines.extend([format_twitter_prompt_section(twitter_results), ""])
+
+    # Hawk Breakout Signals — injected after twitter, before Account
+    if hawk_signals is not None:
+        lines.extend([format_hawk_prompt_section(hawk_signals), ""])
 
     lines.extend([
         "## Account",

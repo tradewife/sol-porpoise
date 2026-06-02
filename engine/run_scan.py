@@ -1450,6 +1450,65 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     except Exception as e:
         print(f"[{run_id}] Twitter CT unavailable: {e}")
 
+    # --- Hawk Breakout Signal Computation (ai-paper mode only) ---
+    hawk_signals: list[Any] = []
+    try:
+        from engine.hawk_breakout import compute_hawk_breakout_signal
+        from engine.mcp_data import extract_sm_tilt
+
+        # Collect whale data from Dextrabot for SM tilt
+        _ai_whale_points: list[Any] = []
+        try:
+            import adapters.dextrabot as _dext_mod
+            _dext = _dext_mod.DextrabotAdapter(cache_dir=str(PROJECT_ROOT / "data" / "raw"))
+            _ai_whale_points = _dext.fetch_wallets()
+            if _ai_whale_points:
+                print(f"[{run_id}] Hawk: {len(_ai_whale_points)} whale datapoints for SM tilt")
+        except Exception as e:
+            print(f"[{run_id}] Hawk: Dextrabot unavailable for SM tilt: {e}")
+
+        # Build HL markets lookup by symbol (from MCP data already parsed)
+        _hl_markets_by_symbol: dict[str, dict[str, Any]] = {}
+        mcp_mkts_raw = state.get("_mcp_perps_markets")
+        if mcp_mkts_raw and isinstance(mcp_mkts_raw, dict):
+            _hl_markets_by_symbol = mcp_mod.parse_perps_markets(mcp_mkts_raw)
+
+        # Compute hawk signal for each symbol in universe
+        for sym in universe[:8]:
+            closes = [dp.value for dp in all_datapoints
+                      if getattr(dp, "symbol", None) == sym
+                      and "mark_price" in str(getattr(dp, "metric", ""))]
+            vols = [dp.value for dp in all_datapoints
+                    if getattr(dp, "symbol", None) == sym
+                    and getattr(dp, "metric", "") == "volume_24h"]
+            if not closes:
+                continue
+            # Pad short series to at least 2 points
+            if len(closes) < 2:
+                closes = closes * 168
+
+            sm_pct = extract_sm_tilt(
+                symbol=sym,
+                whale_points=_ai_whale_points,
+                hl_market=_hl_markets_by_symbol.get(sym),
+            )
+
+            # Default structure_classification to structure_partial when no evaluator wired
+            structure_class = "structure_partial"
+
+            sig = compute_hawk_breakout_signal(
+                market=sym,
+                closes_1h=closes,
+                closes_4h=closes,  # use same series; 4h alignment is slope-based
+                volume_1h=vols if vols else [0.0],
+                sm_long_pct=sm_pct,
+                structure_classification=structure_class,
+            )
+            hawk_signals.append(sig)
+            print(f"[{run_id}] Hawk {sym}: {sig.signal} score={sig.score} {sig.notes}")
+    except Exception as e:
+        print(f"[{run_id}] Hawk computation failed: {e}")
+
     prompt = mcp_mod.format_ai_prompt(
         market_data=rich_data,
         equity=risk_params.equity,
@@ -1460,6 +1519,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
         existing_positions=rich_data.account.positions if rich_data.account else [],
         prior_signal_stats=signal_stats,
         twitter_results=twitter_results_list,
+        hawk_signals=hawk_signals,
     )
 
     # Save prompt for Droid/Hermes to use

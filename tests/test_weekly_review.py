@@ -685,20 +685,20 @@ class TestWeeklyReviewScript:
     """VAL-WR-009: Shell script wrapper present."""
 
     def test_script_exists(self) -> None:
-        script = Path("/home/kt/imperial-agent/scripts/weekly_review.sh")
+        script = Path(__file__).resolve().parent.parent / "scripts" / "weekly_review.sh"
         assert script.exists()
 
     def test_script_is_executable(self) -> None:
-        script = Path("/home/kt/imperial-agent/scripts/weekly_review.sh")
+        script = Path(__file__).resolve().parent.parent / "scripts" / "weekly_review.sh"
         assert script.stat().st_mode & 0o111  # any execute bit
 
     def test_script_has_shebang(self) -> None:
-        script = Path("/home/kt/imperial-agent/scripts/weekly_review.sh")
+        script = Path(__file__).resolve().parent.parent / "scripts" / "weekly_review.sh"
         content = script.read_text()
         assert content.startswith("#!/bin/bash")
 
     def test_script_invokes_correct_module(self) -> None:
-        script = Path("/home/kt/imperial-agent/scripts/weekly_review.sh")
+        script = Path(__file__).resolve().parent.parent / "scripts" / "weekly_review.sh"
         content = script.read_text()
         assert "engine.weekly_review" in content or "weekly_review" in content
 

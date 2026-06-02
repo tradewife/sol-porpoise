@@ -1277,7 +1277,7 @@ class TestDashboardCLI:
             [".venv/bin/python", "-m", "engine.trial_dashboard"],
             capture_output=True,
             text=True,
-            cwd="/home/kt/imperial-agent",
+            cwd=str(Path(__file__).resolve().parent.parent),
             timeout=30,
         )
         assert result.returncode == 0, (
@@ -1293,7 +1293,7 @@ class TestDashboardCLI:
             [".venv/bin/python", "-m", "engine.trial_dashboard"],
             capture_output=True,
             text=True,
-            cwd="/home/kt/imperial-agent",
+            cwd=str(Path(__file__).resolve().parent.parent),
             timeout=30,
         )
         output = result.stdout

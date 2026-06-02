@@ -10,7 +10,7 @@
 # Account
 # ---------------------------------------------------------------------------
 # Reference equity in USDC for paper trading and risk sizing.
-equity: 100
+equity: 1000
 # Currency denomination.
 currency: USDC
 
@@ -18,10 +18,10 @@ currency: USDC
 # Per-trade risk budget
 # ---------------------------------------------------------------------------
 # Maximum fraction of equity risked on a single paper trade.
-# risk_usd = equity * max_risk_pct  →  100 * 0.20 = 20 USDC
+# risk_usd = equity * max_risk_pct  →  1000 * 0.20 = 200 USDC
 max_risk_pct: 0.20
 # Maximum dollar amount at risk per trade (computed, not configured).
-# max_risk_usd = equity * max_risk_pct = 20 USDC
+# max_risk_usd = equity * max_risk_pct = 200 USDC
 
 # ---------------------------------------------------------------------------
 # Leverage
@@ -60,16 +60,17 @@ leverage:
 # ---------------------------------------------------------------------------
 cancel_rules:
   # Minutes after paper order creation before it is automatically cancelled
-  # if still unfilled.
-  timeout_minutes: 90
+  # if still unfilled.  45 min matches the hourly scan cycle.
+  timeout_minutes: 45
   # If the price drifts more than this fraction of the stop distance away
   # from the entry price before the order fills, cancel the order.
   # drift_threshold = 0.8 means cancel if price moves > 80% of stop distance.
   drift_threshold: 0.8
-  # Hard exit time in Australia/Sydney timezone.
-  # All remaining open paper orders are force-cancelled at this time on the
-  # next calendar day after creation.
-  hard_exit_time: "22:00"
+  # Hard exit time — disabled for hourly trial mode.
+  # In the original 3×/day schedule, all remaining orders were force-cancelled
+  # at 22:00.  With hourly scanning, the 45-minute timeout per order makes a
+  # daily hard exit unnecessary.
+  hard_exit_time: ""
   hard_exit_timezone: "Australia/Sydney"
 
 # ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ in_trade:
 # ---------------------------------------------------------------------------
 portfolio:
   # Maximum concurrent open paper trades.
-  max_open_trades: 2
+  max_open_trades: 4
   # Maximum portfolio risk — if two candidates are too correlated, one is
   # skipped to avoid concentration.
   correlation_check: true

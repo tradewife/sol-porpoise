@@ -101,7 +101,7 @@ class TestRiskYaml:
 
     def test_equity_value(self) -> None:
         data = _load("risk.yaml")
-        assert data["equity"] == 100
+        assert data["equity"] == 1000
 
     def test_max_risk_pct(self) -> None:
         data = _load("risk.yaml")
@@ -121,8 +121,9 @@ class TestRiskYaml:
         assert "cancel_rules" in data
         rules = data["cancel_rules"]
         assert isinstance(rules, dict)
-        # Must include timeout and hard exit
+        # Must include timeout
         assert "timeout_minutes" in rules
+        # hard_exit_time key still present but empty/disabled for hourly trial
         assert "hard_exit_time" in rules
 
 

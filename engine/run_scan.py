@@ -278,10 +278,15 @@ def _run_live_paper() -> int:
 
     # Final selection: pick top candidates by expected score
     candidates.sort(key=lambda c: abs(c["score"].weighted_score), reverse=True)
+    max_candidates = run_config.get("run", {}).get("max_candidates", 3)
+    max_open_trades = run_config.get("account", {}).get("max_open_trades", 4)
     final_trades: list[dict[str, Any]] = []
     import engine.playbooks as pb_mod
 
-    for cand in candidates[:2]:
+    for cand in candidates[:max_candidates]:
+        # Stop if we already have enough trades to fill the portfolio
+        if len(final_trades) >= max_open_trades:
+            break
         sym = cand["symbol"]
         price = cand["price"]
         score = cand["score"]

@@ -23,22 +23,13 @@ mode: live-paper-only
 # Not auto-installed — requires explicit human approval to add to crontab.
 schedule:
   timezone: "Australia/Sydney"
-  # Three daily scan windows:
-  #   08:15 — Asia session scan
-  #   17:15 — London pre/early session scan
-  #   23:15 — New York session scan
-  scan_times:
-    - "08:15"
-    - "17:15"
-    - "23:15"
-  # Forced cancel/exit evaluation window:
-  #   22:00 — Evaluate outcomes, cancel stale orders, hard exit remaining
-  outcome_eval_time: "22:00"
-  # Cron expression equivalent (for reference):
-  #   15 8,17,23 * * * run_scan.sh --mode live-paper
-  #   0 22 * * * evaluate_outcomes.sh
-  cron_scan: "15 8,17,23 * * *"
-  cron_outcome_eval: "0 22 * * *"
+  # Hourly scan — every hour on the hour for 24-hour trial.
+  # Auto-evaluate runs inline at the start of each scan cycle, so a separate
+  # outcome-eval cron entry is not needed.
+  cron_scan: "0 * * * *"
+  # No forced hard-exit window in hourly mode; cancel timeout (45 min) handles
+  # stale orders within each cycle.
+  cron_outcome_eval: ""
 
 # ---------------------------------------------------------------------------
 # Account parameters
@@ -46,20 +37,20 @@ schedule:
 account:
   # Starting equity in USDC for paper trading.
   # This is the reference balance for risk sizing and R-multiple calculations.
-  equity: 100
+  equity: 1000
   currency: USDC
   # Risk profile: controls how aggressively the agent sizes positions.
   # "Aggressive-Paper" allows the full 20% risk budget per trade.
   risk_profile: Aggressive-Paper
   # Maximum number of concurrent open paper trades.
-  max_open_trades: 2
+  max_open_trades: 4
 
 # ---------------------------------------------------------------------------
 # Run behaviour
 # ---------------------------------------------------------------------------
 run:
   # Maximum number of paper trade candidates to output per scan.
-  max_candidates: 2
+  max_candidates: 3
   # Always include these symbols in the universe.
   always_include:
     - BTC

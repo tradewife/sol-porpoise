@@ -10,8 +10,12 @@ of each live-paper scan cycle.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
+
+AEST = ZoneInfo("Australia/Sydney")
 
 import yaml
 
@@ -347,7 +351,9 @@ def _make_eval_order(**overrides) -> dict:
         "tp1": 160.0,
         "tp2": 170.0,
         "setup": "breakout",
-        "created_ts_aest": "2026-06-01 08:00:00 Australia/Sydney",
+        "created_ts_aest": (datetime.now(AEST) - timedelta(hours=1)).strftime(
+            "%Y-%m-%d %H:%M:%S Australia/Sydney"
+        ),
         "fees_bps": 5.0,
         "slippage_bps": 3.0,
         "provenance_tags": "test",

@@ -2414,13 +2414,19 @@ class TestEvaluateOutcomes:
         from engine.run_scan import _run_evaluate_outcomes
         from unittest.mock import patch
 
+        # Use a recent timestamp so hard_exit_22_aest doesn't trigger
+        recent_ts = (datetime.now(AEST) - timedelta(hours=1)).strftime(
+            "%Y-%m-%d %H:%M:%S Australia/Sydney"
+        )
         # Order 1: LONG at 150, TP at 160, price at 161 → fills + TP hit → closed
         closed_order = _make_eval_order(
             entry=150.0, stop=145.0, tp1=160.0, symbol="SOL",
+            created_ts_aest=recent_ts,
         )
         # Order 2: LONG at 100, stop at 95, TP at 110, price at 105 → fills, in_trade
         in_trade_order = _make_eval_order(
             entry=100.0, stop=95.0, tp1=110.0, symbol="ETH",
+            created_ts_aest=recent_ts,
         )
         base = _setup_eval_env(tmp_path, [closed_order, in_trade_order])
 

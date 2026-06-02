@@ -75,6 +75,149 @@ def _run_plumbing_dry_run() -> int:
     return 0
 
 
+def _auto_evaluate_open_orders(
+    open_orders: list[dict],
+    evaluator: "outcomes_mod.OutcomeEvaluator",
+    cancel_timeout: int = 45,
+    run_id: str = "",
+) -> list[dict]:
+    """Evaluate open paper orders inline before new data fetching.
+
+    Runs at the start of each _run_live_paper() cycle to resolve orders
+    from the previous hour. Returns the list of orders that remain open
+    (in-trade or still pending within cancel rules).
+    """
+    import engine.paper_orders as po_mod
+
+    current_ts = datetime.now(AEST)
+    remaining_orders: list[dict] = []
+    resolved_count = 0
+
+    # Fetch current mark prices for evaluation
+    price_map = _fetch_mark_prices()
+    if not price_map:
+        print(f"[{run_id}]   WARNING: Could not fetch mark prices for auto-evaluate.")
+        # Can't evaluate without prices — keep all orders
+        return list(open_orders)
+
+    for order_data in open_orders:
+        # Reconstruct PaperOrder
+        try:
+            order = _reconstruct_order(order_data)
+        except (KeyError, ValueError) as e:
+            print(f"[{run_id}]   Skipping malformed order: {e}")
+            remaining_orders.append(order_data)
+            continue
+
+        current_price = price_map.get(order.symbol)
+        if current_price is None or current_price <= 0:
+            print(f"[{run_id}]   No price for {order.symbol}, keeping order.")
+            remaining_orders.append(order_data)
+            continue
+
+        # Parse order timestamp
+        order_ts = po_mod._parse_aest(order.created_ts_aest)
+        if not order_ts:
+            print(f"[{run_id}]   No timestamp for {order.symbol}, keeping order.")
+            remaining_orders.append(order_data)
+            continue
+
+        # Build candle data from current price
+        candle_ts = current_ts
+        candle_high = max(current_price, order.entry)
+        candle_low = min(current_price, order.entry)
+        candle_open = current_price
+        candle_close = current_price
+
+        # Evaluate fill against post-order candle data
+        fill_result = po_mod.evaluate_fill(
+            order,
+            candle_high=candle_high,
+            candle_low=candle_low,
+            candle_open=candle_open,
+            candle_close=candle_close,
+            candle_ts=candle_ts,
+            order_ts=order_ts,
+        )
+
+        # Handle: pre-order data rejected
+        if fill_result.get("status") == "invalid_for_stats":
+            print(f"[{run_id}]   {order.symbol}: pre-order data rejected.")
+            remaining_orders.append(order_data)
+            continue
+
+        # Handle: filled and closed (stop or TP hit)
+        if fill_result.get("status") == "closed":
+            exit_price = fill_result.get("exit_price", current_price)
+            mae_price = candle_low if order.side == po_mod.OrderSide.LONG else candle_high
+            mfe_price = candle_high if order.side == po_mod.OrderSide.LONG else candle_low
+
+            outcome = evaluator.compute_outcome(
+                order, exit_price=exit_price,
+                mae_price=mae_price, mfe_price=mfe_price,
+                fees_bps=order.fees_bps, slippage_bps=order.slippage_bps,
+            )
+            evaluator.write_outcome(outcome)
+
+            # Write signal attribution
+            signals = order_data.get("signals", [])
+            order_id = order_data.get("id", f"{order.symbol}_{order.created_ts_aest}")
+            if signals:
+                evaluator.write_signal_attribution(order_id, signals, result_r=outcome.result_r)
+
+            resolved_count += 1
+            print(f"[{run_id}]   {order.symbol}: closed, R={outcome.result_r:.3f}")
+            continue
+
+        # Handle: filled but still in trade
+        if fill_result.get("status") == "in_trade":
+            should_cancel, reason = po_mod.check_cancel_rules(
+                order, current_price, current_ts,
+                timeout_minutes=cancel_timeout,
+            )
+            if should_cancel and reason:
+                order.filled = po_mod.OrderStatus.CANCELLED
+                cancel_outcome = evaluator.compute_outcome(
+                    order, exit_price=current_price,
+                    fees_bps=order.fees_bps, slippage_bps=order.slippage_bps,
+                )
+                cancel_outcome.notes = reason.value
+                evaluator.write_outcome(cancel_outcome)
+                resolved_count += 1
+                print(f"[{run_id}]   {order.symbol}: cancelled ({reason.value})")
+            else:
+                remaining_orders.append(order_data)
+                print(f"[{run_id}]   {order.symbol}: in_trade, keeping.")
+            continue
+
+        # Handle: not filled (pending)
+        if not fill_result.get("filled"):
+            should_cancel, reason = po_mod.check_cancel_rules(
+                order, current_price, current_ts,
+                timeout_minutes=cancel_timeout,
+            )
+            if should_cancel and reason:
+                order.filled = po_mod.OrderStatus.CANCELLED
+                cancel_outcome = evaluator.compute_outcome(
+                    order, exit_price=current_price,
+                    fees_bps=order.fees_bps, slippage_bps=order.slippage_bps,
+                )
+                cancel_outcome.notes = reason.value
+                evaluator.write_outcome(cancel_outcome)
+                resolved_count += 1
+                print(f"[{run_id}]   {order.symbol}: cancelled ({reason.value})")
+            else:
+                remaining_orders.append(order_data)
+                print(f"[{run_id}]   {order.symbol}: still pending, keeping.")
+            continue
+
+        # Default: keep in open orders
+        remaining_orders.append(order_data)
+
+    print(f"[{run_id}]   Auto-evaluated {len(open_orders)} orders, resolved {resolved_count}")
+    return remaining_orders
+
+
 def _run_live_paper() -> int:
     """Execute the full 14-step scan loop for live paper trading."""
     import adapters.imperial as imperial_mod
@@ -130,6 +273,25 @@ def _run_live_paper() -> int:
         leverage_min=risk_config.get("leverage", {}).get("min", 9),
         leverage_max=risk_config.get("leverage", {}).get("max", 12),
     )
+
+    # --- Auto-Evaluate: evaluate open orders from previous cycle ---
+    # Runs BEFORE any new data fetching or signal extraction.
+    cancel_timeout = risk_config.get("cancel_rules", {}).get("timeout_minutes", 45)
+    if open_orders:
+        print(f"[{run_id}] Auto-evaluating {len(open_orders)} open order(s)...")
+        remaining_orders = _auto_evaluate_open_orders(
+            open_orders=open_orders,
+            evaluator=evaluator,
+            cancel_timeout=cancel_timeout,
+            run_id=run_id,
+        )
+        # Update state with evaluated orders
+        state["open_paper_orders"] = remaining_orders
+        _save_mission_state(state)
+        open_orders = remaining_orders
+        print(f"[{run_id}] Auto-evaluate complete. Remaining open: {len(open_orders)}")
+    else:
+        print(f"[{run_id}] Auto-evaluate: no open orders to evaluate.")
 
     # Data collection
     all_datapoints: list[Any] = []
@@ -553,9 +715,9 @@ def _run_live_paper() -> int:
     # Write report
     report_path = report.write(status=status)
 
-    # Update mission state
+    # Update mission state — merge new trades with any remaining auto-evaluated orders
     state["last_run_id"] = run_id
-    state["open_paper_orders"] = [
+    new_trade_orders = [
         {
             "symbol": t["symbol"],
             "side": t["side"],
@@ -575,6 +737,8 @@ def _run_live_paper() -> int:
         }
         for t in final_trades
     ]
+    # Preserve in-trade/pending orders from auto-evaluate alongside new trades
+    state["open_paper_orders"] = open_orders + new_trade_orders
     _save_mission_state(state)
 
     print(f"[{run_id}] Status: {status}")

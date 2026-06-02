@@ -1,6 +1,6 @@
 # Sol Porpoise
 
-Live-paper crypto perps trading agent for Solana perpetual futures. Two parallel paper accounts -- deterministic and AI -- execute via [Vulcan](https://github.com/Ellipsis-Labs/vulcan-cli) on [Phoenix Perps](https://phoenix.trade/) with real market prices, TP/SL triggers, and live PnL tracking.
+Live-paper crypto trading agent for Solana perpetual futures. Two parallel paper accounts -- deterministic and AI -- execute via [Vulcan](https://github.com/Ellipsis-Labs/vulcan-cli) on [Phoenix Perps](https://phoenix.trade/) with real market prices, TP/SL triggers, and live PnL tracking.
 
 ## Current Status
 

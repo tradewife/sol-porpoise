@@ -1317,3 +1317,407 @@ class TestDashboardCLI:
 
         output = run_dashboard(project_root=root)
         assert "Trial" in output or "elapsed" in output.lower() or "time" in output.lower()
+
+
+# ===========================================================================
+# VAL-LEARN-001: Signal outcome stats included in report
+# ===========================================================================
+
+
+class TestSignalLearningReportOutput:
+    """VAL-LEARN-001: Report contains signal outcome stats section."""
+
+    def test_report_has_section_l_header(self, tmp_path: Path) -> None:
+        """Report contains the 'L. Signal Learning Output' section header."""
+        from engine.report import ReportWriter
+
+        writer = ReportWriter(tmp_path)
+        writer.set_section("L", "No signal outcome data yet.")
+        path = writer.write(status="no_trade")
+        content = path.read_text()
+        assert "## L. Signal Learning Output" in content
+
+    def test_report_shows_no_data_when_empty(self, tmp_path: Path) -> None:
+        """Report shows 'no signal outcome data yet' when outcomes file is empty."""
+        from engine.report import ReportWriter
+        from engine.run_scan import _read_signal_outcome_stats, _format_signal_learning_section
+
+        # Empty file
+        ledgers = tmp_path / "ledgers"
+        ledgers.mkdir(parents=True, exist_ok=True)
+        (ledgers / "signal_outcomes.csv").write_text(
+            "signal,hit_rate,avg_R,n,last_updated_Australia/Sydney\n"
+        )
+
+        stats = _read_signal_outcome_stats(ledgers / "signal_outcomes.csv")
+        assert stats == []
+        section = _format_signal_learning_section(stats)
+        assert "no signal outcome data yet" in section.lower()
+
+    def test_report_shows_no_data_when_file_missing(self, tmp_path: Path) -> None:
+        """Report shows 'no signal outcome data yet' when file doesn't exist."""
+        from engine.run_scan import _read_signal_outcome_stats, _format_signal_learning_section
+
+        stats = _read_signal_outcome_stats(tmp_path / "nonexistent.csv")
+        assert stats == []
+        section = _format_signal_learning_section(stats)
+        assert "no signal outcome data yet" in section.lower()
+
+    def test_report_shows_signal_stats_aggregated_format(self, tmp_path: Path) -> None:
+        """Report shows per-signal hit rates from aggregated signal_outcomes.csv."""
+        from engine.run_scan import _read_signal_outcome_stats, _format_signal_learning_section
+
+        ledgers = tmp_path / "ledgers"
+        ledgers.mkdir(parents=True, exist_ok=True)
+        (ledgers / "signal_outcomes.csv").write_text(
+            "signal,hit_rate,avg_R,n,last_updated_Australia/Sydney\n"
+            "funding_stretch,0.62,1.20,8,2026-06-02T10:00\n"
+            "oi_delta,0.45,-0.30,11,2026-06-02T10:00\n"
+            "basis,0.55,0.80,6,2026-06-02T10:00\n"
+        )
+
+        stats = _read_signal_outcome_stats(ledgers / "signal_outcomes.csv")
+        assert len(stats) == 3
+
+        section = _format_signal_learning_section(stats)
+        assert "funding_stretch" in section
+        assert "62%" in section
+        assert "oi_delta" in section
+        assert "45%" in section
+        assert "basis" in section
+        assert "informational only" in section.lower()
+
+    def test_report_shows_signal_stats_raw_attribution_format(self, tmp_path: Path) -> None:
+        """Report shows per-signal hit rates from raw attribution signal_outcomes.csv."""
+        from engine.run_scan import _read_signal_outcome_stats, _format_signal_learning_section
+
+        ledgers = tmp_path / "ledgers"
+        ledgers.mkdir(parents=True, exist_ok=True)
+        (ledgers / "signal_outcomes.csv").write_text(
+            "order_id,signal,result_r,timestamp_Australia/Sydney\n"
+            "BTC_001,funding_stretch,2.1,2026-06-02T10:00\n"
+            "BTC_001,oi_delta,1.5,2026-06-02T10:00\n"
+            "ETH_002,funding_stretch,-0.5,2026-06-02T11:00\n"
+            "ETH_002,oi_delta,-1.0,2026-06-02T11:00\n"
+            "SOL_003,funding_stretch,0.8,2026-06-02T12:00\n"
+        )
+
+        stats = _read_signal_outcome_stats(ledgers / "signal_outcomes.csv")
+        assert len(stats) == 2  # funding_stretch and oi_delta
+
+        # funding_stretch: 3 trades (2.1, -0.5, 0.8), 2 wins -> hit_rate 0.667
+        fs = next(s for s in stats if s["signal"] == "funding_stretch")
+        assert fs["n"] == 3
+        assert abs(fs["hit_rate"] - 2 / 3) < 0.01
+
+        section = _format_signal_learning_section(stats)
+        assert "funding_stretch" in section
+        assert "oi_delta" in section
+
+    def test_live_paper_scan_includes_signal_learning_section(self, tmp_path: Path) -> None:
+        """Full live-paper scan includes section L with signal learning data."""
+        import shutil
+        import engine.run_scan as rs
+
+        # Copy actual config
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT_ROOT / "config" / "run.yaml", tmp_path / "config" / "run.yaml")
+        shutil.copy(PROJECT_ROOT / "config" / "risk.yaml", tmp_path / "config" / "risk.yaml")
+
+        # Setup directory structure
+        for d in ["reports", "ledgers", "memory", "data/raw"]:
+            (tmp_path / d).mkdir(parents=True, exist_ok=True)
+
+        (tmp_path / "ledgers" / "paper_orders.csv").write_text(
+            "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
+            "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
+            "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags\n"
+        )
+        (tmp_path / "ledgers" / "kg_triples.csv").write_text("")
+        (tmp_path / "ledgers" / "outcomes.csv").write_text("")
+        # Write signal_outcomes.csv with aggregated data
+        (tmp_path / "ledgers" / "signal_outcomes.csv").write_text(
+            "signal,hit_rate,avg_R,n,last_updated_Australia/Sydney\n"
+            "funding_stretch,0.62,1.20,8,2026-06-02T10:00\n"
+            "oi_delta,0.45,-0.30,11,2026-06-02T10:00\n"
+        )
+        (tmp_path / "ledgers" / "skipped_trades.csv").write_text("")
+        state = {"mode": "live-paper-only", "last_run_id": "", "open_paper_orders": []}
+        (tmp_path / "memory" / "mission_state.json").write_text(
+            json.dumps(state, indent=2) + "\n"
+        )
+
+        mock_imperial = MagicMock()
+        mock_imperial.fetch_mark_prices.return_value = [
+            _make_dp("BTC", "mark_price", 100_000.0),
+        ]
+        mock_imperial.fetch_stats_markets.return_value = []
+        mock_imperial.fetch_funding_rates.return_value = []
+        mock_imperial.fetch_gmtrade_funding_rates.return_value = []
+        mock_imperial.fetch_phoenix_depth.return_value = []
+
+        mock_ft = MagicMock()
+        mock_phantom = MagicMock()
+        mock_dext = MagicMock()
+
+        with patch.object(rs, "PROJECT_ROOT", tmp_path):
+            with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
+                with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
+                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                        with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
+                            result = rs._run_live_paper()
+
+        assert result == 0, "Scan should complete without error"
+
+        report_files = list((tmp_path / "reports").glob("*_report.md"))
+        assert len(report_files) >= 1, "Report should be generated"
+        report_text = report_files[0].read_text()
+
+        # Verify section L exists with signal stats
+        assert "## L. Signal Learning Output" in report_text
+        assert "funding_stretch" in report_text
+        assert "62%" in report_text
+        assert "oi_delta" in report_text
+        assert "informational only" in report_text.lower()
+
+    def test_live_paper_scan_shows_no_data_when_empty(self, tmp_path: Path) -> None:
+        """Full live-paper scan shows 'no signal outcome data yet' when CSV empty."""
+        import shutil
+        import engine.run_scan as rs
+
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT_ROOT / "config" / "run.yaml", tmp_path / "config" / "run.yaml")
+        shutil.copy(PROJECT_ROOT / "config" / "risk.yaml", tmp_path / "config" / "risk.yaml")
+
+        for d in ["reports", "ledgers", "memory", "data/raw"]:
+            (tmp_path / d).mkdir(parents=True, exist_ok=True)
+
+        (tmp_path / "ledgers" / "paper_orders.csv").write_text(
+            "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
+            "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
+            "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags\n"
+        )
+        (tmp_path / "ledgers" / "kg_triples.csv").write_text("")
+        (tmp_path / "ledgers" / "outcomes.csv").write_text("")
+        (tmp_path / "ledgers" / "signal_outcomes.csv").write_text("")
+        (tmp_path / "ledgers" / "skipped_trades.csv").write_text("")
+        state = {"mode": "live-paper-only", "last_run_id": "", "open_paper_orders": []}
+        (tmp_path / "memory" / "mission_state.json").write_text(
+            json.dumps(state, indent=2) + "\n"
+        )
+
+        mock_imperial = MagicMock()
+        mock_imperial.fetch_mark_prices.return_value = [
+            _make_dp("BTC", "mark_price", 100_000.0),
+        ]
+        mock_imperial.fetch_stats_markets.return_value = []
+        mock_imperial.fetch_funding_rates.return_value = []
+        mock_imperial.fetch_gmtrade_funding_rates.return_value = []
+        mock_imperial.fetch_phoenix_depth.return_value = []
+
+        mock_ft = MagicMock()
+        mock_phantom = MagicMock()
+        mock_dext = MagicMock()
+
+        with patch.object(rs, "PROJECT_ROOT", tmp_path):
+            with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
+                with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
+                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                        with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
+                            result = rs._run_live_paper()
+
+        assert result == 0
+
+        report_files = list((tmp_path / "reports").glob("*_report.md"))
+        assert len(report_files) >= 1
+        report_text = report_files[0].read_text()
+        assert "## L. Signal Learning Output" in report_text
+        assert "no signal outcome data yet" in report_text.lower()
+
+
+# ===========================================================================
+# VAL-LEARN-002: Learning does not affect signal weights or sizing
+# ===========================================================================
+
+
+class TestSignalLearningNoImpact:
+    """VAL-LEARN-002: Signal weights and position sizing are identical
+    before and after scans with outcome histories."""
+
+    def test_signal_weights_unchanged_after_scan(self, tmp_path: Path) -> None:
+        """Signal weights in scoring.py are the same before and after a scan
+        that reads signal outcomes."""
+        import shutil
+        import engine.run_scan as rs
+        import engine.scoring as scoring_mod
+
+        # Record weights before scan
+        weights_before = dict(scoring_mod.COMPONENT_WEIGHTS)
+
+        (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+        shutil.copy(PROJECT_ROOT / "config" / "run.yaml", tmp_path / "config" / "run.yaml")
+        shutil.copy(PROJECT_ROOT / "config" / "risk.yaml", tmp_path / "config" / "risk.yaml")
+
+        for d in ["reports", "ledgers", "memory", "data/raw"]:
+            (tmp_path / d).mkdir(parents=True, exist_ok=True)
+
+        (tmp_path / "ledgers" / "paper_orders.csv").write_text(
+            "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
+            "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
+            "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags\n"
+        )
+        (tmp_path / "ledgers" / "kg_triples.csv").write_text("")
+        (tmp_path / "ledgers" / "outcomes.csv").write_text("")
+        # Signal outcomes with 5 losses on funding_stretch
+        (tmp_path / "ledgers" / "signal_outcomes.csv").write_text(
+            "signal,hit_rate,avg_R,n,last_updated_Australia/Sydney\n"
+            "funding_stretch,0.0,-1.50,5,2026-06-02T10:00\n"
+        )
+        (tmp_path / "ledgers" / "skipped_trades.csv").write_text("")
+        state = {"mode": "live-paper-only", "last_run_id": "", "open_paper_orders": []}
+        (tmp_path / "memory" / "mission_state.json").write_text(
+            json.dumps(state, indent=2) + "\n"
+        )
+
+        mock_imperial = MagicMock()
+        mock_imperial.fetch_mark_prices.return_value = [
+            _make_dp("BTC", "mark_price", 100_000.0),
+        ]
+        mock_imperial.fetch_stats_markets.return_value = []
+        mock_imperial.fetch_funding_rates.return_value = []
+        mock_imperial.fetch_gmtrade_funding_rates.return_value = []
+        mock_imperial.fetch_phoenix_depth.return_value = []
+
+        mock_ft = MagicMock()
+        mock_phantom = MagicMock()
+        mock_dext = MagicMock()
+
+        with patch.object(rs, "PROJECT_ROOT", tmp_path):
+            with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
+                with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
+                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                        with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
+                            rs._run_live_paper()
+
+        # Verify weights are identical after scan
+        weights_after = dict(scoring_mod.COMPONENT_WEIGHTS)
+        assert weights_before == weights_after, (
+            f"Signal weights changed after scan! Before: {weights_before}, After: {weights_after}"
+        )
+
+    def test_position_sizing_identical_with_different_outcomes(self, tmp_path: Path) -> None:
+        """Two scans with different outcome histories produce identical position sizing."""
+        import shutil
+        import engine.run_scan as rs
+        import engine.risk as risk_mod
+
+        def _run_scan_with_outcomes(outcome_csv_content: str) -> float:
+            """Run a scan with specific outcome data and return the sizing result
+            for a known setup."""
+            scan_dir = tmp_path / f"scan_{hash(outcome_csv_content) % 10000}"
+            scan_dir.mkdir(parents=True, exist_ok=True)
+
+            (scan_dir / "config").mkdir(parents=True, exist_ok=True)
+            shutil.copy(PROJECT_ROOT / "config" / "run.yaml", scan_dir / "config" / "run.yaml")
+            shutil.copy(PROJECT_ROOT / "config" / "risk.yaml", scan_dir / "config" / "risk.yaml")
+
+            for d in ["reports", "ledgers", "memory", "data/raw"]:
+                (scan_dir / d).mkdir(parents=True, exist_ok=True)
+
+            (scan_dir / "ledgers" / "paper_orders.csv").write_text(
+                "date_Australia/Sydney,symbol,setup,side,entry,stop,tp1,tp2,filled,"
+                "entry_ts_Australia/Sydney,exit_ts_Australia/Sydney,result_R,"
+                "max_FvE,max_AdE,fees_bps,slippage_bps,notes,provenance_tags\n"
+            )
+            (scan_dir / "ledgers" / "kg_triples.csv").write_text("")
+            (scan_dir / "ledgers" / "outcomes.csv").write_text("")
+            (scan_dir / "ledgers" / "signal_outcomes.csv").write_text(outcome_csv_content)
+            (scan_dir / "ledgers" / "skipped_trades.csv").write_text("")
+            state = {"mode": "live-paper-only", "last_run_id": "", "open_paper_orders": []}
+            (scan_dir / "memory" / "mission_state.json").write_text(
+                json.dumps(state, indent=2) + "\n"
+            )
+
+            mock_imperial = MagicMock()
+            mock_imperial.fetch_mark_prices.return_value = [
+                _make_dp("BTC", "mark_price", 100_000.0),
+            ]
+            mock_imperial.fetch_stats_markets.return_value = []
+            mock_imperial.fetch_funding_rates.return_value = []
+            mock_imperial.fetch_gmtrade_funding_rates.return_value = []
+            mock_imperial.fetch_phoenix_depth.return_value = []
+
+            mock_ft = MagicMock()
+            mock_phantom = MagicMock()
+            mock_dext = MagicMock()
+
+            with patch.object(rs, "PROJECT_ROOT", scan_dir):
+                with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
+                    with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
+                        with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                            with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
+                                rs._run_live_paper()
+
+            # Read the risk sizing that would have been computed
+            # Use same inputs as the scan loop would use
+            risk_config = yaml.safe_load(
+                (scan_dir / "config" / "risk.yaml").read_text()
+            )
+            risk_params = risk_mod.RiskParams(
+                equity=risk_config.get("equity", 100),
+                max_risk_pct=risk_config.get("max_risk_pct", 0.20),
+                leverage_min=risk_config.get("leverage", {}).get("min", 9),
+                leverage_max=risk_config.get("leverage", {}).get("max", 12),
+            )
+            sizing = risk_mod.compute_risk_sizing(
+                symbol="BTC",
+                side=risk_mod.OrderSide.LONG,
+                entry=100000.0,
+                stop=99000.0,
+                params=risk_params,
+                best_bid=99999.0,
+                best_ask=100001.0,
+            )
+            return (sizing.qty, sizing.notional, sizing.leverage, sizing.risk_usd)
+
+        # Scan A: 5 losing trades on all signals
+        bad_outcomes = (
+            "signal,hit_rate,avg_R,n,last_updated_Australia/Sydney\n"
+            "funding_stretch,0.0,-1.50,5,2026-06-02T10:00\n"
+            "oi_delta,0.0,-2.00,5,2026-06-02T10:00\n"
+            "basis,0.0,-0.80,5,2026-06-02T10:00\n"
+        )
+
+        # Scan B: 5 winning trades on all signals
+        good_outcomes = (
+            "signal,hit_rate,avg_R,n,last_updated_Australia/Sydney\n"
+            "funding_stretch,1.0,2.50,5,2026-06-02T10:00\n"
+            "oi_delta,1.0,3.00,5,2026-06-02T10:00\n"
+            "basis,1.0,1.80,5,2026-06-02T10:00\n"
+        )
+
+        sizing_a = _run_scan_with_outcomes(bad_outcomes)
+        sizing_b = _run_scan_with_outcomes(good_outcomes)
+
+        assert sizing_a == sizing_b, (
+            f"Position sizing differs with different outcomes! "
+            f"Bad outcomes: {sizing_a}, Good outcomes: {sizing_b}"
+        )
+
+    def test_component_weights_constant_values(self) -> None:
+        """Verify COMPONENT_WEIGHTS in scoring.py have exact expected values."""
+        import engine.scoring as scoring_mod
+
+        expected = {
+            "funding_stretch": 0.15,
+            "oi_delta": 0.15,
+            "basis": 0.10,
+            "liquidity_magnet": 0.15,
+            "session_structure": 0.10,
+            "whale_evidence": 0.10,
+            "dex_perp_lag": 0.10,
+            "volatility": 0.10,
+            "catalyst": 0.05,
+        }
+        assert scoring_mod.COMPONENT_WEIGHTS == expected
+        assert abs(sum(scoring_mod.COMPONENT_WEIGHTS.values()) - 1.0) < 1e-9

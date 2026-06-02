@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from datetime import datetime
@@ -57,6 +58,113 @@ def _fetch_mark_prices() -> dict[str, float]:
     except Exception:
         pass
     return price_map
+
+
+def _read_signal_outcome_stats(signal_outcomes_path: Path) -> list[dict[str, Any]]:
+    """Read signal_outcomes.csv and return per-signal hit-rate stats for report.
+
+    Handles two schemas:
+    - Raw attribution: order_id,signal,result_r,timestamp_Australia/Sydney
+    - Aggregated: signal,hit_rate,avg_R,n,last_updated_Australia/Sydney
+
+    Returns list of dicts with keys: signal, hit_rate, avg_R, n.
+    Returns empty list if file missing or empty.
+    """
+    if not signal_outcomes_path.exists():
+        return []
+
+    try:
+        with open(signal_outcomes_path, encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return []
+            header_lower = [h.strip().lower() for h in header]
+
+            # Detect schema
+            if "hit_rate" in header_lower:
+                # Aggregated format — read directly
+                idx_signal = header_lower.index("signal") if "signal" in header_lower else -1
+                idx_hr = header_lower.index("hit_rate") if "hit_rate" in header_lower else -1
+                idx_ar = header_lower.index("avg_r") if "avg_r" in header_lower else -1
+                idx_n = header_lower.index("n") if "n" in header_lower else -1
+
+                stats: list[dict[str, Any]] = []
+                for row in reader:
+                    try:
+                        sig = row[idx_signal].strip() if idx_signal >= 0 and idx_signal < len(row) else ""
+                        if not sig:
+                            continue
+                        hr = float(row[idx_hr]) if idx_hr >= 0 and idx_hr < len(row) else 0.0
+                        ar = float(row[idx_ar]) if idx_ar >= 0 and idx_ar < len(row) else 0.0
+                        n = int(row[idx_n]) if idx_n >= 0 and idx_n < len(row) else 0
+                        stats.append({"signal": sig, "hit_rate": hr, "avg_R": ar, "n": n})
+                    except (ValueError, TypeError, IndexError):
+                        continue
+                return stats
+
+            elif "result_r" in header_lower:
+                # Raw attribution format — compute stats from result_r values
+                idx_signal = header_lower.index("signal") if "signal" in header_lower else -1
+                idx_rr = header_lower.index("result_r") if "result_r" in header_lower else -1
+
+                signal_data: dict[str, list[float]] = {}
+                for row in reader:
+                    try:
+                        sig = row[idx_signal].strip() if idx_signal >= 0 and idx_signal < len(row) else ""
+                        rr = row[idx_rr].strip() if idx_rr >= 0 and idx_rr < len(row) else ""
+                        if sig and rr:
+                            r = float(rr)
+                            signal_data.setdefault(sig, []).append(r)
+                    except (ValueError, TypeError, IndexError):
+                        continue
+
+                result: list[dict[str, Any]] = []
+                for sig, rs in signal_data.items():
+                    n = len(rs)
+                    wins = sum(1 for r in rs if r > 0)
+                    result.append({
+                        "signal": sig,
+                        "hit_rate": wins / n if n > 0 else 0.0,
+                        "avg_R": sum(rs) / n if n > 0 else 0.0,
+                        "n": n,
+                    })
+                return result
+
+            else:
+                return []
+    except Exception:
+        return []
+
+
+def _format_signal_learning_section(stats: list[dict[str, Any]]) -> str:
+    """Format signal outcome stats into a report section string.
+
+    Shows per-signal hit rates when data is available, or
+    'no signal outcome data yet' when no outcomes exist.
+    """
+    if not stats:
+        return "No signal outcome data yet."
+
+    lines = ["### Signal Performance (Prior Outcomes)", ""]
+    lines.append(
+        "| Signal | Hit Rate | Avg R | Trades |"
+    )
+    lines.append(
+        "|--------|----------|-------|--------|"
+    )
+    for s in sorted(stats, key=lambda x: x["signal"]):
+        pct = f"{s['hit_rate'] * 100:.0f}%"
+        avg_r = f"{s['avg_R']:+.2f}"
+        lines.append(
+            f"| {s['signal']} | {pct} | {avg_r} | {s['n']} |"
+        )
+    lines.append("")
+    lines.append(
+        "*Signal weights and position sizing are NOT affected by prior outcomes. "
+        "This section is informational only.*"
+    )
+    return "\n".join(lines)
 
 
 def _run_plumbing_dry_run() -> int:
@@ -292,6 +400,15 @@ def _run_live_paper() -> int:
         print(f"[{run_id}] Auto-evaluate complete. Remaining open: {len(open_orders)}")
     else:
         print(f"[{run_id}] Auto-evaluate: no open orders to evaluate.")
+
+    # --- Signal Learning Output (informational only, before signal extraction) ---
+    signal_outcomes_csv = PROJECT_ROOT / "ledgers" / "signal_outcomes.csv"
+    signal_stats = _read_signal_outcome_stats(signal_outcomes_csv)
+    report.set_section("L", _format_signal_learning_section(signal_stats))
+    if signal_stats:
+        print(f"[{run_id}] Signal learning: {len(signal_stats)} signals with prior outcomes")
+    else:
+        print(f"[{run_id}] Signal learning: no prior outcome data")
 
     # Data collection
     all_datapoints: list[Any] = []

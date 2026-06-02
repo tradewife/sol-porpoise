@@ -48,6 +48,7 @@ class TestReportWriter:
             ("I", "Citations and Provenance"),
             ("J", "OutcomeGraph CSV"),
             ("K", "Prompt and System Audit"),
+            ("L", "Signal Learning Output"),
         ]:
             assert f"## {letter}. {title}" in content, f"Missing section {letter}. {title}"
 
@@ -98,7 +99,7 @@ class TestDryRunReport:
 
         path = build_dry_run_report(tmp_path)
         content = path.read_text()
-        for letter in "ABCDEFGHIJK":
+        for letter in "ABCDEFGHIJKL":
             assert f"## {letter}." in content
 
     def test_dry_run_timestamps_valid(self, tmp_path: Path) -> None:

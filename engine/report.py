@@ -23,6 +23,7 @@ SECTION_HEADERS = [
     ("I", "Citations and Provenance"),
     ("J", "OutcomeGraph CSV"),
     ("K", "Prompt and System Audit"),
+    ("L", "Signal Learning Output"),
 ]
 
 
@@ -146,5 +147,9 @@ def build_dry_run_report(report_dir: str | Path = "reports") -> Path:
         f"| Next improvement | Run with live adapters |",
     ]
     writer.set_section("K", "\n".join(audit_lines))
+
+    writer.set_section("L", (
+        "No signal outcome data yet (dry run)."
+    ))
 
     return writer.write(status="no_trade")

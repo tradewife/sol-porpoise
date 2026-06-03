@@ -1398,7 +1398,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     report.set_section("L", _format_signal_learning_section(signal_stats))
 
     # --- Gather Market Data ---
-    # HyperliquidAdapter for market data (replaces Phantom MCP), Flash Trade MCP for trading overview
+    # HyperliquidAdapter for market data, Flash Trade MCP for trading overview
     rich_data = mcp_mod.RichMarketData()
     all_datapoints: list[Any] = []
 
@@ -1660,6 +1660,50 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     except Exception as e:
         print(f"[{run_id}] Hawk computation failed: {e}")
 
+    # --- Extract signals for AI prompt (includes book_imbalance) ---
+    ai_signals: dict | None = None
+    try:
+        import engine.signals as _signals_mod
+        import engine.volatility as _vol_mod
+
+        # Collect HL-specific datapoints (safe: may not be defined if adapter failed)
+        _ai_hl_pts: list[Any] = []
+        try:
+            _ai_hl_pts.extend(hl_points)  # type: ignore[name-defined]
+        except NameError:
+            pass
+        try:
+            _ai_hl_pts.extend(hl_ob_points)  # type: ignore[name-defined]
+        except NameError:
+            pass
+
+        # Convert SOL candles to engine format for signal extraction
+        _ai_sol_candles: list[Any] = []
+        if _ai_candles_1h:
+            _ai_sol_candles = _hl_mod.candles_to_engine_candles(_ai_candles_1h)
+
+        # Compute ATR for SOL from candle data
+        _ai_sol_atr: float | None = None
+        if _ai_sol_candles and len(_ai_sol_candles) >= 14:
+            try:
+                _ai_sol_atr = _vol_mod.compute_atr(_ai_sol_candles)
+            except ValueError:
+                pass
+
+        # Extract all 10 signal components for SOL
+        ai_signals = _signals_mod.extract_signals(
+            symbol="SOL",
+            datapoints=all_datapoints,
+            whale_points=_ai_whale_points,
+            hl_points=_ai_hl_pts,
+            candles=_ai_sol_candles if _ai_sol_candles else None,
+            precomputed_atr=_ai_sol_atr,
+        )
+        active_sigs = sum(1 for v in ai_signals.values() if v.label != "unknown")
+        print(f"[{run_id}] Signals extracted for AI prompt: {len(ai_signals)} components, {active_sigs} active")
+    except Exception as e:
+        print(f"[{run_id}] WARNING: Signal extraction for AI prompt failed: {e}")
+
     prompt = mcp_mod.format_ai_prompt(
         market_data=rich_data,
         equity=risk_params.equity,
@@ -1671,6 +1715,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
         prior_signal_stats=signal_stats,
         twitter_results=twitter_results_list,
         hawk_signals=hawk_signals,
+        signals=ai_signals,
     )
 
     # Save prompt for Droid/Hermes to use

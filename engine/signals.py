@@ -506,19 +506,14 @@ def _extract_book_imbalance(
 
     if ratio > 1.6:
         value = 2
-        direction = "long"
     elif ratio > 1.3:
         value = 1
-        direction = "long"
     elif ratio < 0.60:
         value = -2
-        direction = "short"
     elif ratio < 0.77:
         value = -1
-        direction = "short"
     else:
         value = 0
-        direction = "neutral"
 
     # Confidence: stronger imbalance = higher confidence
     if abs(value) == 2:

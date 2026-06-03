@@ -832,6 +832,9 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
         except ImportError:
             pass
 
+        if not vulcan_available:
+            print(f"[{run_id}]   WARNING: Vulcan CLI not available, using synthetic execution", file=sys.stderr)
+
         if vulcan_available:
             # Vulcan uses real market prices — skip synthetic passive entry check
             sizing = risk_mod.compute_risk_sizing(
@@ -1871,6 +1874,9 @@ def _run_ai_paper(account_id: str = "ai") -> int:
         vulcan_available = VulcanAdapter.is_available()
     except ImportError:
         pass
+
+    if not vulcan_available:
+        print(f"[{run_id}] WARNING: Vulcan CLI not available, using synthetic execution", file=sys.stderr)
 
     for cand in valid_candidates[:max_candidates]:
         if len(final_trades) >= max_open_trades:

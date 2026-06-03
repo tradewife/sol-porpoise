@@ -13,6 +13,7 @@ The vulcan CLI must be installed: https://github.com/Ellipsis-Labs/vulcan-cli
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -23,6 +24,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 AEST = ZoneInfo("Australia/Sydney")
+
+# Resolve Vulcan binary with fallback for cron's minimal PATH.
+# Under cron, PATH is typically /usr/bin:/bin which misses ~/.local/bin.
+_VULCAN_BIN = shutil.which("vulcan") or os.path.expanduser("~/.local/bin/vulcan")
 
 
 @dataclass
@@ -333,5 +338,5 @@ class VulcanAdapter:
 
     @staticmethod
     def is_available() -> bool:
-        """Check if vulcan CLI is installed."""
-        return shutil.which("vulcan") is not None
+        """Check if vulcan CLI is installed (works under cron's minimal PATH)."""
+        return os.path.isfile(_VULCAN_BIN) and os.access(_VULCAN_BIN, os.X_OK)

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from adapters.base import DataPoint, Provenance, SourceTier
@@ -436,3 +437,337 @@ class TestSourceHealth:
         assert "funding_stretch" in stats
         assert stats["funding_stretch"]["n"] == 5
         assert stats["oi_delta"]["hit_rate"] == 1.0  # both positive
+
+
+# ---------------------------------------------------------------------------
+# Hyperdash fixture data (mimics real GraphQL response)
+# ---------------------------------------------------------------------------
+
+HYPERDASH_FIXTURE_RESPONSE = {
+    "data": {
+        "analytics": {
+            "cohortSummary": {
+                "timestamp": "2026-06-03T03:42:33.230Z",
+                "totalTraders": 100159,
+                "sizeCohorts": [
+                    {
+                        "id": "apex",
+                        "label": "Apex",
+                        "range": "$5M+",
+                        "totalTraders": 182,
+                        "longNotional": 1143647899.766456,
+                        "shortNotional": 1708273004.4482234,
+                        "topMarkets": [
+                            {"ticker": "BTC", "longNotional": 190135793.40987, "shortNotional": 329801070.46634},
+                            {"ticker": "HYPE", "longNotional": 117183597.59758, "shortNotional": 253376125.82778},
+                            {"ticker": "ETH", "longNotional": 93735178.50809, "shortNotional": 165796745.77965},
+                        ],
+                    },
+                    {
+                        "id": "whale",
+                        "label": "Whale",
+                        "range": "$1M - $5M",
+                        "totalTraders": 585,
+                        "longNotional": 752723222.1816001,
+                        "shortNotional": 661097650.954182,
+                        "topMarkets": [
+                            {"ticker": "BTC", "longNotional": 132800714.51548, "shortNotional": 133096986.84744},
+                            {"ticker": "HYPE", "longNotional": 135810629.06266, "shortNotional": 119229862.64846},
+                            {"ticker": "ETH", "longNotional": 40074255.35068, "shortNotional": 62353007.64627},
+                            {"ticker": "SOL", "longNotional": 20182134.24771, "shortNotional": 20137246.467},
+                        ],
+                    },
+                    {
+                        "id": "large",
+                        "label": "Large",
+                        "range": "$100K - $1M",
+                        "totalTraders": 3595,
+                        "longNotional": 805013831.5355067,
+                        "shortNotional": 507006051.6757757,
+                        "topMarkets": [
+                            {"ticker": "BTC", "longNotional": 147160599.55454, "shortNotional": 154358756.42594},
+                            {"ticker": "HYPE", "longNotional": 121805660.21106, "shortNotional": 68977717.12142},
+                            {"ticker": "ETH", "longNotional": 39771250.39831, "shortNotional": 44389879.32998},
+                            {"ticker": "SOL", "longNotional": 24198252.04956, "shortNotional": 15022489.01901},
+                        ],
+                    },
+                    {
+                        "id": "medium",
+                        "label": "Medium",
+                        "range": "$10K - $100K",
+                        "totalTraders": 10923,
+                        "longNotional": 315278859.79741824,
+                        "shortNotional": 182731499.35139278,
+                        "topMarkets": [
+                            {"ticker": "BTC", "longNotional": 63959462.85377, "shortNotional": 56831553.59398},
+                            {"ticker": "SOL", "longNotional": 9611972.62173, "shortNotional": 7139011.10826},
+                        ],
+                    },
+                ],
+            }
+        }
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# Hyperdash tests (VAL-HDASH-001 through VAL-HDASH-005)
+# ---------------------------------------------------------------------------
+
+
+class TestHyperdashAdapter:
+    def test_protocol_conformance(self) -> None:
+        """VAL-HDASH-001: HyperdashAdapter implements DataAdapter protocol."""
+        from adapters.base import DataAdapter
+        from adapters.hyperdash import HyperdashAdapter
+        adapter = HyperdashAdapter()
+        assert isinstance(adapter, DataAdapter)
+        assert hasattr(adapter, "fetch")
+        assert hasattr(adapter, "provenance")
+        assert hasattr(adapter, "health_check")
+        assert callable(adapter.fetch)
+        assert callable(adapter.provenance)
+        assert callable(adapter.health_check)
+
+    def test_cohort_extraction(self) -> None:
+        """VAL-HDASH-002: Extracts cohort metrics for Large Whale and Whale tiers."""
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        points = adapter._parse_response(HYPERDASH_FIXTURE_RESPONSE)
+
+        assert len(points) >= 6  # 3 metrics x 2 tiers = 6 minimum
+
+        metrics = {}
+        for p in points:
+            key = (p.symbol, p.metric, p.attrs.get("cohort_id"))
+            metrics[key] = p
+
+        # Check whale cohort ($1M-$5M): SOL long=20,182,134 / (20,182,134 + 20,137,246) ≈ 50.06%
+        whale_long_pct = metrics.get(("SOL", "whale_cohort_long_pct", "whale"))
+        assert whale_long_pct is not None
+        assert isinstance(whale_long_pct.value, float)
+        assert abs(whale_long_pct.value - 50.06) < 1.0  # ~50% neutral
+
+        whale_direction = metrics.get(("SOL", "cohort_direction", "whale"))
+        assert whale_direction is not None
+        assert whale_direction.value == "neutral"  # 50% is in 45-55% range
+
+        whale_oi = metrics.get(("SOL", "cohort_oi_usd", "whale"))
+        assert whale_oi is not None
+        assert isinstance(whale_oi.value, float)
+        assert whale_oi.value > 0
+
+        # Check large cohort ($100K-$1M): SOL long=24,198,252 / (24,198,252 + 15,022,489) ≈ 61.69%
+        large_long_pct = metrics.get(("SOL", "whale_cohort_long_pct", "large"))
+        assert large_long_pct is not None
+        assert abs(large_long_pct.value - 61.69) < 1.0  # ~62%
+
+        large_direction = metrics.get(("SOL", "cohort_direction", "large"))
+        assert large_direction is not None
+        assert large_direction.value == "long"  # >55%
+
+        large_oi = metrics.get(("SOL", "cohort_oi_usd", "large"))
+        assert large_oi is not None
+        assert isinstance(large_oi.value, float)
+        assert large_oi.value > 0
+
+    def test_cohort_direction_thresholds(self) -> None:
+        """VAL-HDASH-002: cohort_direction thresholds: long >55%, short <45%, neutral 45-55%."""
+        from adapters.hyperdash import _compute_cohort_direction
+        assert _compute_cohort_direction(62.0) == "long"
+        assert _compute_cohort_direction(55.1) == "long"
+        assert _compute_cohort_direction(38.0) == "short"
+        assert _compute_cohort_direction(44.9) == "short"
+        assert _compute_cohort_direction(50.0) == "neutral"
+        assert _compute_cohort_direction(45.0) == "neutral"
+        assert _compute_cohort_direction(55.0) == "neutral"
+        assert _compute_cohort_direction(45.1) == "neutral"
+        assert _compute_cohort_direction(54.9) == "neutral"
+
+    def test_provenance(self) -> None:
+        """VAL-HDASH-003: Provenance source_tier=OPEN, confidence=0.75."""
+        from adapters.hyperdash import HyperdashAdapter
+        adapter = HyperdashAdapter()
+        prov = adapter.provenance()
+        assert prov.source_tier == SourceTier.OPEN
+        assert prov.confidence == 0.75
+        assert "Hyperdash" in prov.source_name
+        assert "graphql" in prov.source_link
+
+    def test_graceful_failure_connection_error(self) -> None:
+        """VAL-HDASH-004: Connection error returns empty list."""
+        import asyncio
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        with patch.object(adapter._client, "post", side_effect=httpx.ConnectError("timeout")):
+            result = asyncio.run(adapter.fetch())
+        assert result == []
+
+    def test_graceful_failure_timeout(self) -> None:
+        """VAL-HDASH-004: Timeout returns empty list."""
+        import asyncio
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        with patch.object(adapter._client, "post", side_effect=httpx.ReadTimeout("read timeout")):
+            result = asyncio.run(adapter.fetch())
+        assert result == []
+
+    def test_graceful_failure_invalid_json(self) -> None:
+        """VAL-HDASH-004: Invalid JSON returns empty list."""
+        import asyncio
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.side_effect = ValueError("invalid json")
+
+        with patch.object(adapter._client, "post", return_value=mock_response):
+            result = asyncio.run(adapter.fetch())
+        assert result == []
+
+    def test_graceful_failure_http_500(self) -> None:
+        """VAL-HDASH-004: HTTP 500 returns empty list."""
+        import asyncio
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Server Error", request=MagicMock(), response=mock_response,
+        )
+
+        with patch.object(adapter._client, "post", return_value=mock_response):
+            result = asyncio.run(adapter.fetch())
+        assert result == []
+
+    def test_sol_only_filter(self) -> None:
+        """VAL-HDASH-005: Only SOL data is returned, other assets excluded."""
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        points = adapter._parse_response(HYPERDASH_FIXTURE_RESPONSE)
+
+        # All DataPoints should be SOL only
+        assert all(p.symbol == "SOL" for p in points)
+
+        # Should NOT have BTC, ETH, HYPE data points
+        non_sol = [p for p in points if p.symbol != "SOL"]
+        assert len(non_sol) == 0
+
+    def test_sol_only_fixture_with_multiple_assets(self) -> None:
+        """VAL-HDASH-005: Fixture with BTC and SOL only returns SOL points."""
+        from adapters.hyperdash import HyperdashAdapter
+
+        fixture = {
+            "data": {
+                "analytics": {
+                    "cohortSummary": {
+                        "timestamp": "2026-06-03T03:42:33.230Z",
+                        "totalTraders": 100,
+                        "sizeCohorts": [
+                            {
+                                "id": "whale",
+                                "label": "Whale",
+                                "range": "$1M - $5M",
+                                "totalTraders": 10,
+                                "longNotional": 1000000,
+                                "shortNotional": 500000,
+                                "topMarkets": [
+                                    {"ticker": "BTC", "longNotional": 500000, "shortNotional": 300000},
+                                    {"ticker": "SOL", "longNotional": 200000, "shortNotional": 100000},
+                                ],
+                            },
+                        ],
+                    }
+                }
+            }
+        }
+
+        adapter = HyperdashAdapter()
+        points = adapter._parse_response(fixture)
+
+        # Only SOL DataPoints
+        assert all(p.symbol == "SOL" for p in points)
+        assert len(points) == 3  # 3 metrics for 1 cohort
+
+    def test_health_check_success(self) -> None:
+        """Health check returns healthy=True on 200 response."""
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch.object(adapter._client, "post", return_value=mock_response):
+            health = adapter.health_check()
+
+        assert health.name == "Hyperdash"
+        assert health.healthy is True
+        assert health.latency_ms is not None
+
+    def test_health_check_failure(self) -> None:
+        """Health check returns healthy=False on connection error."""
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        with patch.object(adapter._client, "post", side_effect=httpx.ConnectError("fail")):
+            health = adapter.health_check()
+
+        assert health.name == "Hyperdash"
+        assert health.healthy is False
+        assert health.error_message is not None
+
+    def test_no_sol_in_top_markets_returns_empty(self) -> None:
+        """When SOL is not in any cohort's topMarkets, returns empty list."""
+        from adapters.hyperdash import HyperdashAdapter
+
+        fixture = {
+            "data": {
+                "analytics": {
+                    "cohortSummary": {
+                        "timestamp": "2026-06-03T03:42:33.230Z",
+                        "totalTraders": 100,
+                        "sizeCohorts": [
+                            {
+                                "id": "whale",
+                                "label": "Whale",
+                                "range": "$1M - $5M",
+                                "totalTraders": 10,
+                                "longNotional": 1000000,
+                                "shortNotional": 500000,
+                                "topMarkets": [
+                                    {"ticker": "BTC", "longNotional": 500000, "shortNotional": 300000},
+                                    {"ticker": "ETH", "longNotional": 200000, "shortNotional": 100000},
+                                ],
+                            },
+                        ],
+                    }
+                }
+            }
+        }
+
+        adapter = HyperdashAdapter()
+        points = adapter._parse_response(fixture)
+        assert points == []
+
+    def test_empty_response_returns_empty(self) -> None:
+        """Empty GraphQL response returns empty list."""
+        from adapters.hyperdash import HyperdashAdapter
+
+        adapter = HyperdashAdapter()
+        points = adapter._parse_response({"data": {"analytics": {"cohortSummary": {"sizeCohorts": []}}}})
+        assert points == []
+
+    def test_target_cohorts_constant(self) -> None:
+        """Verify target cohort IDs are correct."""
+        from adapters.hyperdash import TARGET_COHORTS
+        assert "whale" in TARGET_COHORTS
+        assert "large" in TARGET_COHORTS
+        assert "$1M" in TARGET_COHORTS["whale"]
+        assert "$100K" in TARGET_COHORTS["large"]

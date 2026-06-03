@@ -23,14 +23,9 @@ mcp:
       - get_pool_data           # AUM, LP stats, custody ratios
     primary_for: [prices, leverage, pool_utilization]
 
-  # Phantom MCP: perps positions, account balance, HL markets
-  phantom:
-    enabled: true
-    tools:
-      - perps_account           # Account balance (USDC)
-      - perps_positions         # Open positions with PnL
-      - perps_markets           # HL market data (funding, OI, volume)
-    primary_for: [positions, funding, open_interest, volume]
+  # HL direct adapter replaces per-MCP data fetching.
+  # See adapters/hyperliquid.py for the direct HTTP implementation.
+  # Original MCP section removed in favor of direct API calls.
 
 # ---------------------------------------------------------------------------
 # AI Reasoning

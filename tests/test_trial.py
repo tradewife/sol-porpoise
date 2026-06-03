@@ -251,7 +251,7 @@ class TestScanUsesConfigValues:
         with patch.object(rs, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             result = rs._run_live_paper()
 
@@ -325,7 +325,7 @@ class TestScanUsesConfigValues:
         with patch.object(rs, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             with patch("engine.risk.RiskParams", CapturingRiskParams):
                                 result = rs._run_live_paper()
@@ -436,7 +436,7 @@ class TestAutoEvaluateWithOpenOrders:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             result = rs._run_live_paper()
 
@@ -458,7 +458,7 @@ class TestAutoEvaluateWithOpenOrders:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=MagicMock()):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=MagicMock()):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=MagicMock()):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=MagicMock()):
                             rs._run_live_paper()
 
@@ -492,7 +492,7 @@ class TestAutoEvaluateNoop:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             result = rs._run_live_paper()
 
@@ -517,7 +517,7 @@ class TestAutoEvaluateNoop:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=MagicMock()):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=MagicMock()):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=MagicMock()):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=MagicMock()):
                             result = rs._run_live_paper()
 
@@ -548,7 +548,7 @@ class TestAutoEvaluatePreservesInTrade:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=MagicMock()):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=MagicMock()):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=MagicMock()):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=MagicMock()):
                             rs._run_live_paper()
 
@@ -593,7 +593,7 @@ class TestAutoEvaluateCancelRules:
             with patch("engine.paper_orders.evaluate_fill", return_value=not_filled_result):
                 with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                     with patch("adapters.flash_trade.FlashTradeAdapter", return_value=MagicMock()):
-                        with patch("adapters.phantom.PhantomAdapter", return_value=MagicMock()):
+                        with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=MagicMock()):
                             with patch("adapters.dextrabot.DextrabotAdapter", return_value=MagicMock()):
                                 rs._run_live_paper()
 
@@ -629,7 +629,7 @@ class TestAutoEvaluateCancelRules:
             with patch("engine.paper_orders.evaluate_fill", return_value=not_filled_result):
                 with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                     with patch("adapters.flash_trade.FlashTradeAdapter", return_value=MagicMock()):
-                        with patch("adapters.phantom.PhantomAdapter", return_value=MagicMock()):
+                        with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=MagicMock()):
                             with patch("adapters.dextrabot.DextrabotAdapter", return_value=MagicMock()):
                                 rs._run_live_paper()
 
@@ -680,7 +680,7 @@ class TestAutoEvaluateOrdering:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=MagicMock()):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=MagicMock()):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=MagicMock()):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=MagicMock()):
                             # Patch _fetch_mark_prices to track when auto-eval fetches
                             orig_auto_fetch = rs._fetch_mark_prices
@@ -947,7 +947,7 @@ class TestManualHourlyCycle:
         with patch.object(rs, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             result = rs._run_live_paper()
 
@@ -1469,7 +1469,7 @@ class TestSignalLearningReportOutput:
         with patch.object(rs, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             result = rs._run_live_paper()
 
@@ -1528,7 +1528,7 @@ class TestSignalLearningReportOutput:
         with patch.object(rs, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             result = rs._run_live_paper()
 
@@ -1601,7 +1601,7 @@ class TestSignalLearningNoImpact:
         with patch.object(rs, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             rs._run_live_paper()
 
@@ -1660,7 +1660,7 @@ class TestSignalLearningNoImpact:
             with patch.object(rs, "PROJECT_ROOT", scan_dir):
                 with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                     with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                        with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                        with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                             with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                                 rs._run_live_paper()
 

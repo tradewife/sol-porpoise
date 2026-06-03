@@ -498,7 +498,7 @@ def extract_signals(
         symbol: Trading symbol to extract signals for.
         datapoints: General market data (prices, funding, OI, etc.).
         whale_points: Whale/smart-money wallet data.
-        hl_points: Hyperliquid data from Phantom MCP.
+        hl_points: Hyperliquid data from direct API adapter.
         candles: OHLC candle data for VWAP and volatility.
         precomputed_atr: Pre-computed ATR value (used when candles insufficient).
 

@@ -599,7 +599,7 @@ class TestFullScanLoopEndToEnd:
         with patch.object(run_scan_mod, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             result = run_scan_mod._run_live_paper()
 
@@ -781,7 +781,7 @@ class TestMissionStateProvenanceKG:
         with patch.object(run_scan_mod, "PROJECT_ROOT", tmp_path):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imperial):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_phantom):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_phantom):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dext):
                             run_scan_mod._run_live_paper()
 

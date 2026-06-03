@@ -427,7 +427,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
     """Execute the full 14-step scan loop for live paper trading."""
     import adapters.imperial as imperial_mod
     import adapters.flash_trade as ft_mod
-    import adapters.phantom as phantom_mod
+    import adapters.hyperliquid as hl_mod
     import adapters.dextrabot as dext_mod
     import engine.kg as kg_mod
     import engine.scoring as scoring_mod
@@ -466,7 +466,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
     kg = kg_mod.KGWriter(acct / "ledgers" / "kg_triples.csv")
     imperial = imperial_mod.ImperialAdapter()
     ft_adapter = ft_mod.FlashTradeAdapter()
-    phantom = phantom_mod.PhantomAdapter()
+    hl_adapter = hl_mod.HyperliquidAdapter()
     dext = dext_mod.DextrabotAdapter(cache_dir=str(PROJECT_ROOT / "data" / "raw"))
     tracker = po_mod.PaperOrderTracker(acct / "ledgers" / "paper_orders.csv")
     evaluator = outcomes_mod.OutcomeEvaluator(
@@ -1318,7 +1318,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
             rich_data.raw_prices[m.symbol] = m.price
         print(f"[{run_id}] MCP trading overview: {len(rich_data.markets)} markets")
 
-    # Phase 2: Try Phantom MCP for perps account and positions
+    # Phase 2: Try MCP for perps account and positions
     mcp_account_raw = state.get("_mcp_perps_account")
     if mcp_account_raw and isinstance(mcp_account_raw, dict):
         rich_data.account = mcp_mod.parse_account_summary(mcp_account_raw)
@@ -1331,7 +1331,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
             rich_data.account.positions = existing_positions
         print(f"[{run_id}] MCP existing positions: {len(existing_positions)}")
 
-    # Phase 3: Try Phantom MCP for HL market data (funding, OI, volume)
+    # Phase 3: Try MCP for HL market data (funding, OI, volume)
     mcp_markets_raw = state.get("_mcp_perps_markets")
     if mcp_markets_raw and isinstance(mcp_markets_raw, dict):
         hl_markets = mcp_mod.parse_perps_markets(mcp_markets_raw)
@@ -1779,7 +1779,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     # Section H: Assumptions and Gaps
     report.set_section("H", (
         "### Assumptions\n"
-        "- Market data from Flash Trade + Phantom MCP tools, with Imperial API fallback\n"
+        "- Market data from Flash Trade MCP tools, with Imperial API fallback\n"
         "- AI reasoning produces trade decisions (replaces deterministic signal scoring)\n"
         "- Risk sizing, cancel rules, and outcome evaluation remain deterministic\n"
         "- Signal weights in scoring.py are NOT used (AI decides independently)\n\n"

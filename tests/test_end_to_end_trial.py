@@ -124,7 +124,7 @@ def _mock_imperial_adapter(mark_prices: dict[str, float] | None = None) -> Magic
 
 
 def _mock_other_adapters() -> tuple[MagicMock, MagicMock, MagicMock]:
-    """Return (mock_ft, mock_phantom, mock_dext)."""
+    """Return (mock_ft, mock_hl, mock_dext)."""
     return MagicMock(), MagicMock(), MagicMock()
 
 
@@ -220,7 +220,7 @@ class TestCronHourlyProducesOutput:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imp):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_ph):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_ph):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dx):
                             result = rs._run_live_paper()
 
@@ -240,7 +240,7 @@ class TestCronHourlyProducesOutput:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imp):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_ph):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_ph):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dx):
                             rs._run_live_paper()
 
@@ -263,7 +263,7 @@ class TestCronHourlyProducesOutput:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imp):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_ph):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_ph):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dx):
                             result = rs._run_live_paper()
 
@@ -292,7 +292,7 @@ class TestDashboardShowsTrialMetrics:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imp):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_ph):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_ph):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dx):
                             rs._run_live_paper()
 
@@ -405,7 +405,7 @@ class TestFullTrialCycleEndToEnd:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imp):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_ph):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_ph):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dx):
                             scan_result = rs._run_live_paper()
 
@@ -453,7 +453,7 @@ class TestFullTrialCycleEndToEnd:
         with patch.object(rs, "PROJECT_ROOT", base):
             with patch("adapters.imperial.ImperialAdapter", return_value=mock_imp):
                 with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                    with patch("adapters.phantom.PhantomAdapter", return_value=mock_ph):
+                    with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_ph):
                         with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dx):
                             result = rs._run_live_paper()
 
@@ -476,7 +476,7 @@ class TestFullTrialCycleEndToEnd:
             with patch.object(rs, "PROJECT_ROOT", base):
                 with patch("adapters.imperial.ImperialAdapter", return_value=mock_imp):
                     with patch("adapters.flash_trade.FlashTradeAdapter", return_value=mock_ft):
-                        with patch("adapters.phantom.PhantomAdapter", return_value=mock_ph):
+                        with patch("adapters.hyperliquid.HyperliquidAdapter", return_value=mock_ph):
                             with patch("adapters.dextrabot.DextrabotAdapter", return_value=mock_dx):
                                 rs._run_live_paper()
 

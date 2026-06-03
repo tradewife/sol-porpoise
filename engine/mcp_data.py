@@ -1,4 +1,4 @@
-"""MCP data fetcher: calls Flash Trade and Phantom MCP tools and normalizes
+"""MCP data fetcher: calls Flash Trade MCP tools and normalizes
 results into the project's DataPoint format for use by the AI agent scan loop.
 
 This module does NOT call MCP tools directly (those are available only in the
@@ -39,7 +39,7 @@ class MarketOverview:
 
 @dataclass
 class AccountState:
-    """Current perps account state from Phantom."""
+    """Current perps account state."""
     total_value_usd: float
     available_usd: float
     withdrawable_usd: float
@@ -73,7 +73,7 @@ def overview_to_datapoints(data: RichMarketData) -> list[DataPoint]:
     """Convert RichMarketData into a list of DataPoints for report/ledger use."""
     points: list[DataPoint] = []
     prov_flash = _make_mcp_provenance("FlashTrade-MCP")
-    prov_phantom = _make_mcp_provenance("Phantom-MCP")
+    prov_hl = _make_mcp_provenance("Hyperliquid-MCP")
 
     for market in data.markets:
         sym = market.symbol
@@ -118,12 +118,12 @@ def overview_to_datapoints(data: RichMarketData) -> list[DataPoint]:
         points.append(DataPoint(
             symbol="ACCOUNT", metric="perps_total_value_usd",
             value=data.account.total_value_usd,
-            provenance=prov_phantom,
+            provenance=prov_hl,
         ))
         points.append(DataPoint(
             symbol="ACCOUNT", metric="perps_available_usd",
             value=data.account.available_usd,
-            provenance=prov_phantom,
+            provenance=prov_hl,
         ))
 
     return points
@@ -216,7 +216,7 @@ def parse_trading_overview(raw: dict[str, Any]) -> list[MarketOverview]:
 
 
 def parse_account_summary(raw: dict[str, Any]) -> AccountState:
-    """Parse the result of phantom___perps_account into AccountState."""
+    """Parse the result of perps_account MCP tool into AccountState."""
     if not isinstance(raw, dict):
         return AccountState(total_value_usd=0, available_usd=0, withdrawable_usd=0)
 
@@ -230,7 +230,7 @@ def parse_account_summary(raw: dict[str, Any]) -> AccountState:
 
 
 def parse_perps_positions(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Parse the result of phantom___perps_positions into a list of position dicts."""
+    """Parse the result of perps_positions MCP tool into a list of position dicts."""
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
@@ -239,7 +239,7 @@ def parse_perps_positions(raw: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def parse_perps_markets(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Parse the result of phantom___perps_markets into a symbol-keyed dict."""
+    """Parse the result of perps_markets MCP tool into a symbol-keyed dict."""
     result: dict[str, dict[str, Any]] = {}
     if not isinstance(raw, dict):
         return result

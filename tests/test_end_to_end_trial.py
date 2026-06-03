@@ -540,13 +540,14 @@ class TestNoRegressions:
         expected = {
             "funding_stretch": 0.15,
             "oi_delta": 0.15,
-            "basis": 0.10,
+            "basis": 0.05,
             "liquidity_magnet": 0.15,
             "session_structure": 0.10,
-            "whale_evidence": 0.10,
+            "whale_evidence": 0.07,
             "dex_perp_lag": 0.10,
             "volatility": 0.10,
             "catalyst": 0.05,
+            "book_imbalance": 0.08,
         }
         assert COMPONENT_WEIGHTS == expected
 

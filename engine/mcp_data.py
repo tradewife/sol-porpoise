@@ -295,6 +295,7 @@ def format_ai_prompt(
     prior_signal_stats: list[dict[str, Any]] | None = None,
     twitter_results: list[TwitterResult] | None = None,
     hawk_signals: list | None = None,
+    signals: dict | None = None,
 ) -> str:
     """Build the AI reasoning prompt from aggregated market data.
 
@@ -387,6 +388,17 @@ def format_ai_prompt(
         util_str = util if util else "-"
         lines.append(f"| {sym} | {price_str} | {fr_str} | {oi_str} | {vol_str} | {lev_str} | {util_str} |")
     lines.append("")
+
+    # Signal components summary (includes book_imbalance)
+    if signals is not None:
+        lines.append("## Signal Components")
+        for sig_name, sig_comp in signals.items():
+            if hasattr(sig_comp, "value") and hasattr(sig_comp, "confidence") and hasattr(sig_comp, "label"):
+                lines.append(
+                    f"- {sig_name}: value={sig_comp.value}, "
+                    f"confidence={sig_comp.confidence:.2f}, label={sig_comp.label}"
+                )
+        lines.append("")
 
     # ATR estimates (1.5% of price as proxy when real ATR unavailable)
     lines.append("## ATR Estimates")

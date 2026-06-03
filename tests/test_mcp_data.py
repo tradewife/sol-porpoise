@@ -560,3 +560,68 @@ class TestHawkDataFlowIntegration:
             hawk_signals=[sig],
         )
         assert "signal: none" in prompt
+
+
+# ===========================================================================
+# format_ai_prompt book_imbalance signal tests (VAL-CROSS-006)
+# ===========================================================================
+
+
+class TestFormatAiPromptBookImbalance:
+    """VAL-CROSS-006: format_ai_prompt includes book_imbalance signal data."""
+
+    def test_prompt_includes_book_imbalance_signal(self):
+        """format_ai_prompt with signals dict includes book_imbalance in output."""
+        from engine.scoring import SignalComponent
+        data = _make_rich_data()
+        signals = {
+            "book_imbalance": SignalComponent(
+                name="book_imbalance", value=2.0, confidence=0.9, label="bid_heavy_2",
+            ),
+            "funding_stretch": SignalComponent(
+                name="funding_stretch", value=0.5, confidence=0.8, label="contrarian_bullish",
+            ),
+        }
+        prompt = format_ai_prompt(
+            market_data=data,
+            equity=1000.0,
+            max_open_trades=4,
+            max_candidates=3,
+            prompt_id="test-book-imb",
+            signals=signals,
+        )
+        assert "book_imbalance" in prompt
+        assert "bid_heavy_2" in prompt
+
+    def test_prompt_signal_section_appears(self):
+        """Signal Components section appears when signals are provided."""
+        from engine.scoring import SignalComponent
+        data = _make_rich_data()
+        signals = {
+            "book_imbalance": SignalComponent(
+                name="book_imbalance", value=1.0, confidence=0.6, label="bid_heavy_1",
+            ),
+        }
+        prompt = format_ai_prompt(
+            market_data=data,
+            equity=1000.0,
+            max_open_trades=4,
+            max_candidates=3,
+            prompt_id="test-sig-section",
+            signals=signals,
+        )
+        assert "## Signal Components" in prompt
+        assert "book_imbalance" in prompt
+        assert "value=1.0" in prompt
+
+    def test_prompt_no_signal_section_without_signals(self):
+        """No Signal Components section when signals=None (default)."""
+        data = _make_rich_data()
+        prompt = format_ai_prompt(
+            market_data=data,
+            equity=1000.0,
+            max_open_trades=4,
+            max_candidates=3,
+            prompt_id="test-no-sig",
+        )
+        assert "## Signal Components" not in prompt

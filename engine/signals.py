@@ -1,6 +1,6 @@
 """Signal extraction: derive SignalComponent values from DataPoints and candles.
 
-Extracts 9 signal components from market data:
+Extracts 10 signal components from market data:
 - funding_stretch: z-score of current funding rate vs history (contrarian)
 - oi_delta: OI change with price direction context
 - basis: cross-venue price difference via compute_basis()
@@ -10,6 +10,7 @@ Extracts 9 signal components from market data:
 - dex_perp_lag: timestamp lead/lag across venues
 - volatility: ATR and regime classification from volatility.py
 - catalyst: news sentiment via Kukapay adapter (bearish/neutral/bullish)
+- book_imbalance: orderbook bid/ask ratio thresholds (10th signal)
 """
 
 from __future__ import annotations
@@ -475,6 +476,69 @@ def _extract_volatility(
         return _unknown("volatility")
 
 
+def _extract_book_imbalance(
+    symbol: str,
+    datapoints: list[DataPoint],
+) -> SignalComponent:
+    """Extract book imbalance signal from book_imbalance_ratio DataPoint.
+
+    Thresholds:
+        >1.6 → value=+2, direction="long"   (strong bid wall)
+        >1.3 → value=+1, direction="long"   (bid-heavy)
+        <0.60 → value=-2, direction="short"  (strong ask wall)
+        <0.77 → value=-1, direction="short"  (ask-heavy)
+        else → value=0,  direction="neutral"
+
+    Returns value in {-2, -1, 0, 1, 2} with corresponding direction.
+    Missing data degrades to value=0, confidence=0, label="unknown".
+    """
+    # Find the book_imbalance_ratio DataPoint for this symbol
+    ratio: float | None = None
+    for dp in _filter_symbol(datapoints, symbol):
+        if dp.metric == "book_imbalance_ratio" and isinstance(dp.value, (int, float)):
+            val = float(dp.value)
+            if math.isfinite(val):
+                ratio = val
+                break
+
+    if ratio is None:
+        return _unknown("book_imbalance")
+
+    if ratio > 1.6:
+        value = 2
+        direction = "long"
+    elif ratio > 1.3:
+        value = 1
+        direction = "long"
+    elif ratio < 0.60:
+        value = -2
+        direction = "short"
+    elif ratio < 0.77:
+        value = -1
+        direction = "short"
+    else:
+        value = 0
+        direction = "neutral"
+
+    # Confidence: stronger imbalance = higher confidence
+    if abs(value) == 2:
+        confidence = 0.9
+    elif abs(value) == 1:
+        confidence = 0.6
+    else:
+        confidence = 0.3
+
+    label = f"bid_heavy_{value}" if value > 0 else \
+            f"ask_heavy_{abs(value)}" if value < 0 else "balanced"
+
+    return SignalComponent(
+        name="book_imbalance",
+        value=float(value),
+        confidence=confidence,
+        label=label,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main extraction function
 # ---------------------------------------------------------------------------
@@ -488,7 +552,7 @@ def extract_signals(
     candles: list[Candle] | None = None,
     precomputed_atr: float | None = None,
 ) -> dict[str, SignalComponent]:
-    """Extract all 9 signal components from data sources.
+    """Extract all 10 signal components from data sources.
 
     Returns dict[str, SignalComponent] with keys matching COMPONENT_WEIGHTS.
     Unknown components have value=0, confidence=0, label="unknown".
@@ -547,6 +611,12 @@ def extract_signals(
         result["volatility"] = _extract_volatility(symbol, candles, precomputed_atr=precomputed_atr)
     except Exception:
         result["volatility"] = _unknown("volatility")
+
+    # Book imbalance: orderbook bid/ask ratio thresholds
+    try:
+        result["book_imbalance"] = _extract_book_imbalance(symbol, datapoints)
+    except Exception:
+        result["book_imbalance"] = _unknown("book_imbalance")
 
     # Catalyst: extract from news via Kukapay adapter if available
     try:

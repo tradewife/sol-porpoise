@@ -83,7 +83,7 @@ class TestScoring:
             for name in [
                 "funding_stretch", "oi_delta", "basis", "liquidity_magnet",
                 "session_structure", "whale_evidence", "dex_perp_lag",
-                "volatility", "catalyst",
+                "volatility", "catalyst", "book_imbalance",
             ]
         }
         score = compute_signal_score("BTC", components)
@@ -97,7 +97,7 @@ class TestScoring:
             for name in [
                 "funding_stretch", "oi_delta", "basis", "liquidity_magnet",
                 "session_structure", "whale_evidence", "dex_perp_lag",
-                "volatility", "catalyst",
+                "volatility", "catalyst", "book_imbalance",
             ]
         }
         partial = {
@@ -120,6 +120,7 @@ class TestScoring:
             "dex_perp_lag": SignalComponent(name="dex_perp_lag", value=0, confidence=0, label="unknown"),
             "volatility": SignalComponent(name="volatility", value=0, confidence=0, label="unknown"),
             "catalyst": SignalComponent(name="catalyst", value=0, confidence=0, label="unknown"),
+            "book_imbalance": SignalComponent(name="book_imbalance", value=0, confidence=0, label="unknown"),
         }
         score = compute_signal_score("BTC", components)
         assert score.weighted_score == 0.0
@@ -962,9 +963,9 @@ def _make_candle_list(n: int = 20, base_price: float = 100.0, volatility: float 
 
 
 class TestExtractSignalsKeys:
-    """VAL-SIG-001: extract_signals returns dict with exactly 9 keys."""
+    """VAL-SIG-001: extract_signals returns dict with exactly the keys matching COMPONENT_WEIGHTS."""
 
-    def test_returns_nine_keys_matching_component_weights(self) -> None:
+    def test_returns_keys_matching_component_weights(self) -> None:
         from engine.signals import extract_signals
         from engine.scoring import COMPONENT_WEIGHTS
         result = extract_signals("BTC", [], [], [], candles=None)
@@ -977,10 +978,10 @@ class TestExtractSignalsKeys:
         for key, comp in result.items():
             assert isinstance(comp, SignalComponent), f"{key} is not SignalComponent"
 
-    def test_exactly_nine_components(self) -> None:
+    def test_exactly_ten_components(self) -> None:
         from engine.signals import extract_signals
         result = extract_signals("BTC", [], [], [])
-        assert len(result) == 9
+        assert len(result) == 10
 
 
 class TestExtractSignalsGracefulDegradation:
@@ -1038,7 +1039,7 @@ class TestExtractSignalsGracefulDegradation:
         for args in inputs:
             try:
                 result = extract_signals(*args)
-                assert len(result) == 9
+                assert len(result) == 10
             except TypeError:
                 # None arguments that don't match list type are OK to skip
                 pass
@@ -1471,6 +1472,222 @@ class TestCatalystAlwaysUnknown:
         assert result["catalyst"].label == "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Book Imbalance Signal tests (VAL-SIGNAL-001 through VAL-SIGNAL-007)
+# ---------------------------------------------------------------------------
+
+
+class TestBookImbalanceThresholds:
+    """VAL-SIGNAL-001: _extract_book_imbalance produces correct scores for all thresholds."""
+
+    @pytest.mark.parametrize(
+        "ratio,expected_value,expected_direction_label",
+        [
+            (0.50, -2, "ask_heavy"),   # < 0.60 → -2
+            (0.65, -1, "ask_heavy"),   # 0.60-0.77 → -1
+            (0.90, 0, "balanced"),     # 0.77-1.3 → 0
+            (1.40, 1, "bid_heavy"),    # 1.3-1.6 → +1
+            (1.80, 2, "bid_heavy"),    # > 1.6 → +2
+        ],
+    )
+    def test_threshold_scoring(self, ratio: float, expected_value: int, expected_direction_label: str) -> None:
+        """All 5 threshold levels produce correct value and direction label."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=ratio)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == expected_value, f"ratio={ratio}: expected {expected_value}, got {result.value}"
+        assert expected_direction_label in result.label, f"ratio={ratio}: expected '{expected_direction_label}' in label, got '{result.label}'"
+
+    def test_strong_bid_wall(self) -> None:
+        """Ratio 2.0 → value=+2 (strong bid wall)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=2.0)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 2
+        assert result.confidence == 0.9
+
+    def test_bid_heavy(self) -> None:
+        """Ratio 1.4 → value=+1 (bid-heavy)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=1.4)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 1
+        assert result.confidence == 0.6
+
+    def test_balanced(self) -> None:
+        """Ratio 1.0 → value=0 (balanced)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=1.0)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 0
+        assert result.confidence == 0.3
+
+    def test_ask_heavy(self) -> None:
+        """Ratio 0.70 → value=-1 (ask-heavy)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=0.70)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == -1
+        assert result.confidence == 0.6
+
+    def test_strong_ask_wall(self) -> None:
+        """Ratio 0.50 → value=-2 (strong ask wall)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=0.50)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == -2
+        assert result.confidence == 0.9
+
+    def test_exact_boundary_1_6(self) -> None:
+        """Ratio exactly 1.6 → value=+1 (not > 1.6)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=1.6)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 1
+
+    def test_exact_boundary_1_3(self) -> None:
+        """Ratio exactly 1.3 → value=0 (not > 1.3)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=1.3)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 0
+
+    def test_exact_boundary_0_77(self) -> None:
+        """Ratio exactly 0.77 → value=0 (not < 0.77)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=0.77)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 0
+
+    def test_exact_boundary_0_60(self) -> None:
+        """Ratio exactly 0.60 → value=-1 (not < 0.60)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=0.60)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == -1
+
+
+class TestBookImbalanceValueRange:
+    """VAL-SIGNAL-002: signal_book_imbalance value always in {-2,-1,0,1,2}."""
+
+    @pytest.mark.parametrize(
+        "ratio",
+        [0.001, 0.01, 0.10, 0.50, 0.60, 0.65, 0.77, 0.90, 1.0, 1.1, 1.3, 1.4, 1.6, 1.7, 5.0, 10.0, 100.0],
+    )
+    def test_value_in_valid_set(self, ratio: float) -> None:
+        """For any valid ratio, value is always in {-2,-1,0,1,2}."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=ratio)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value in {-2, -1, 0, 1, 2}, f"ratio={ratio}: value={result.value}"
+
+    def test_nan_input_unknown(self) -> None:
+        """NaN ratio → unknown."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=float("nan"))]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 0.0
+        assert result.label == "unknown"
+
+    def test_inf_input_unknown(self) -> None:
+        """Inf ratio → unknown (inf is not finite)."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(metric="book_imbalance_ratio", value=float("inf"))]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.value == 0.0
+        assert result.label == "unknown"
+
+
+class TestBookImbalanceWeight:
+    """VAL-SIGNAL-003: Weight 0.08 in scoring.py."""
+
+    def test_weight_is_0_08(self) -> None:
+        from engine.scoring import COMPONENT_WEIGHTS
+        assert COMPONENT_WEIGHTS["book_imbalance"] == 0.08
+
+
+class TestWeightsSumToOne:
+    """VAL-SIGNAL-004: All 10 weights sum to exactly 1.0."""
+
+    def test_weights_sum_to_one(self) -> None:
+        from engine.scoring import COMPONENT_WEIGHTS
+        assert len(COMPONENT_WEIGHTS) == 10
+        assert sum(COMPONENT_WEIGHTS.values()) == 1.0
+
+
+class TestAllWeightsMatchSpec:
+    """VAL-SIGNAL-005: Individual weight correctness."""
+
+    @pytest.mark.parametrize(
+        "key,expected",
+        [
+            ("funding_stretch", 0.15),
+            ("oi_delta", 0.15),
+            ("basis", 0.05),
+            ("liquidity_magnet", 0.15),
+            ("session_structure", 0.10),
+            ("whale_evidence", 0.07),
+            ("dex_perp_lag", 0.10),
+            ("volatility", 0.10),
+            ("catalyst", 0.05),
+            ("book_imbalance", 0.08),
+        ],
+    )
+    def test_weight_value(self, key: str, expected: float) -> None:
+        from engine.scoring import COMPONENT_WEIGHTS
+        assert COMPONENT_WEIGHTS[key] == expected, f"{key}: expected {expected}, got {COMPONENT_WEIGHTS[key]}"
+
+
+class TestBookImbalanceInExtractSignals:
+    """VAL-SIGNAL-006: book_imbalance included in extract_signals output."""
+
+    def test_included_in_output(self) -> None:
+        """extract_signals() returns dict with book_imbalance key."""
+        from engine.signals import extract_signals
+        from engine.scoring import SignalComponent
+        dps = [_make_dp(metric="book_imbalance_ratio", value=1.8)]
+        result = extract_signals("BTC", dps, [], [])
+        assert "book_imbalance" in result
+        assert isinstance(result["book_imbalance"], SignalComponent)
+        assert result["book_imbalance"].value == 2.0
+
+    def test_wired_in_pipeline(self) -> None:
+        """book_imbalance value flows from DataPoint through extract_signals."""
+        from engine.signals import extract_signals
+        for ratio, expected_val in [(0.50, -2), (0.70, -1), (1.0, 0), (1.4, 1), (1.8, 2)]:
+            dps = [_make_dp(metric="book_imbalance_ratio", value=ratio)]
+            result = extract_signals("BTC", dps, [], [])
+            assert result["book_imbalance"].value == expected_val, \
+                f"ratio={ratio}: expected {expected_val}, got {result['book_imbalance'].value}"
+
+
+class TestBookImbalanceMissingData:
+    """VAL-SIGNAL-007: book_imbalance degrades gracefully with no data."""
+
+    def test_missing_data_unknown(self) -> None:
+        """No book_imbalance_ratio DataPoint → value=0, confidence=0, label='unknown'."""
+        from engine.signals import _extract_book_imbalance
+        result = _extract_book_imbalance("BTC", [])
+        assert result.value == 0.0
+        assert result.confidence == 0.0
+        assert result.label == "unknown"
+
+    def test_wrong_symbol_unknown(self) -> None:
+        """DataPoint for different symbol → unknown."""
+        from engine.signals import _extract_book_imbalance
+        dps = [_make_dp(symbol="ETH", metric="book_imbalance_ratio", value=1.8)]
+        result = _extract_book_imbalance("BTC", dps)
+        assert result.label == "unknown"
+
+    def test_extract_signals_missing_book_imbalance(self) -> None:
+        """extract_signals with no book_imbalance data → unknown component."""
+        from engine.signals import extract_signals
+        result = extract_signals("BTC", [], [], [])
+        assert result["book_imbalance"].value == 0.0
+        assert result["book_imbalance"].confidence == 0.0
+        assert result["book_imbalance"].label == "unknown"
+
+
 class TestSignalBounds:
     """VAL-SIG-011: Symbol filtering and value/confidence range bounds."""
 
@@ -1554,7 +1771,7 @@ class TestSignalScoringIntegration:
         candles = _make_candle_list(n=20)
         signals = extract_signals("BTC", dps, [], [], candles=candles)
         score = compute_signal_score("BTC", signals)
-        assert score.weighted_score != 0.0 or len(score.unknown_components) < 9
+        assert score.weighted_score != 0.0 or len(score.unknown_components) < 10
         assert isinstance(score.weighted_score, float)
         assert _math.isfinite(score.weighted_score)
 

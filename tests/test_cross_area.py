@@ -317,7 +317,7 @@ class TestSignalPlaybookTriggers:
             for name in [
                 "funding_stretch", "oi_delta", "basis", "liquidity_magnet",
                 "session_structure", "whale_evidence", "dex_perp_lag",
-                "volatility", "catalyst",
+                "volatility", "catalyst", "book_imbalance",
             ]
         }
         pbs = generate_playbooks("BTC", 100000.0, 500.0, signals, 99990.0, 100010.0)
@@ -714,7 +714,7 @@ class TestCrossVenueBasisAndWhale:
             name: SignalComponent(name, 0.8, 0.9, "bullish")
             for name in ["funding_stretch", "oi_delta", "basis", "liquidity_magnet",
                          "session_structure", "whale_evidence", "dex_perp_lag",
-                         "volatility", "catalyst"]
+                         "volatility", "catalyst", "book_imbalance"]
         }
         btc_score = compute_signal_score("BTC", strong)
 
@@ -723,7 +723,7 @@ class TestCrossVenueBasisAndWhale:
             name: SignalComponent(name, 0.1, 0.2, "slight_bullish")
             for name in ["funding_stretch", "oi_delta", "basis", "liquidity_magnet",
                          "session_structure", "whale_evidence", "dex_perp_lag",
-                         "volatility", "catalyst"]
+                         "volatility", "catalyst", "book_imbalance"]
         }
         eth_score = compute_signal_score("ETH", weak)
 

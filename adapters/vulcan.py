@@ -94,7 +94,7 @@ class VulcanAdapter:
 
     def __init__(
         self,
-        vulcan_bin: str = "vulcan",
+        vulcan_bin: str = _VULCAN_BIN,
         account_id: str = "deterministic",
         project_root: Path | None = None,
     ):

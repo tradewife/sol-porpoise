@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,7 +15,59 @@ from adapters.normalizer import make_provenance
 
 
 # ---------------------------------------------------------------------------
-# Dextrabot tests
+# Dextrabot fixture data (mimics real API response)
+# ---------------------------------------------------------------------------
+
+DEXT_FIXTURE_WALLETS = {
+    "count": 3,
+    "next": "?limit=3&offset=3",
+    "previous": None,
+    "results": [
+        {
+            "user_token": "0xabc1230000000000000000000000000000000001",
+            "portfolio_perp_week_pnl": "125000.50",
+            "total_unrealized_pnl": "5000.00",
+            "win_complated_rate": "65.0",
+            "total_win_rate": "62.0",
+            "portfolio_perp_week_sharpe": "2.1",
+            "avg_uleverage_value": "5.0",
+            "portfolio_perp_week_growth_rate": "45.0",
+            "portfolio_perp_week_dd": "-12.5",
+            "rtx_count": "150",
+            "margin_roi": 150.2,
+        },
+        {
+            "user_token": "0xdef4560000000000000000000000000000000002",
+            "portfolio_perp_week_pnl": "-80000.25",
+            "total_unrealized_pnl": "-2000.00",
+            "win_complated_rate": "40.0",
+            "total_win_rate": "42.0",
+            "portfolio_perp_week_sharpe": "0.5",
+            "avg_uleverage_value": "3.0",
+            "portfolio_perp_week_growth_rate": "350.0",
+            "portfolio_perp_week_dd": "-8.0",
+            "rtx_count": "55",
+            "margin_roi": 4461.4,
+        },
+        {
+            "user_token": "0x7890000000000000000000000000000000000003",
+            "portfolio_perp_week_pnl": "55000.75",
+            "total_unrealized_pnl": "1000.00",
+            "win_complated_rate": "30.0",
+            "total_win_rate": "35.0",
+            "portfolio_perp_week_sharpe": "0.8",
+            "avg_uleverage_value": "2.5",
+            "portfolio_perp_week_growth_rate": "50.0",
+            "portfolio_perp_week_dd": "-15.0",
+            "rtx_count": "20",
+            "margin_roi": 67.9,
+        },
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Dextrabot tests (VAL-DEX-001 through VAL-DEX-004)
 # ---------------------------------------------------------------------------
 
 class TestDextrabotAdapter:
@@ -24,32 +79,153 @@ class TestDextrabotAdapter:
         assert p.source_tier == SourceTier.OPEN
 
     def test_classify_entity_smart_money(self) -> None:
+        """VAL-DEX-002: sharpe > 1.5 AND win_rate > 55 → smart_money."""
         from adapters.dextrabot import WalletData, classify_entity
         w = WalletData(address="test", sharpe=2.0, win_rate=60.0, pnl=5000)
         assert classify_entity(w) == "smart_money"
 
-    def test_classify_entity_whale(self) -> None:
+    def test_classify_entity_whale_unlabeled(self) -> None:
+        """VAL-DEX-002: |pnl| > 10000 but not smart_money → whale_unlabeled."""
         from adapters.dextrabot import WalletData, classify_entity
         w = WalletData(address="test", pnl=50000)
         assert classify_entity(w) == "whale_unlabeled"
 
+    def test_classify_entity_roi_whale(self) -> None:
+        """VAL-DEX-002: growth_rate > 200 AND tx_count > 30 → roi_whale."""
+        from adapters.dextrabot import WalletData, classify_entity
+        w = WalletData(address="test", growth_rate=350.0, tx_count=55)
+        assert classify_entity(w) == "roi_whale"
+
+    def test_classify_entity_roi_whale_low_tx_count(self) -> None:
+        """VAL-DEX-002: growth_rate > 200 but tx_count <= 30 → not roi_whale."""
+        from adapters.dextrabot import WalletData, classify_entity
+        w = WalletData(address="test", growth_rate=350.0, tx_count=20, pnl=50000)
+        assert classify_entity(w) == "whale_unlabeled"
+
+    def test_classify_entity_roi_whale_low_growth(self) -> None:
+        """VAL-DEX-002: tx_count > 30 but growth_rate <= 200 → not roi_whale."""
+        from adapters.dextrabot import WalletData, classify_entity
+        w = WalletData(address="test", growth_rate=150.0, tx_count=50, pnl=50000)
+        assert classify_entity(w) == "whale_unlabeled"
+
     def test_classify_entity_unknown(self) -> None:
+        """VAL-DEX-002: no criteria met → unknown."""
         from adapters.dextrabot import WalletData, classify_entity
         w = WalletData(address="test", pnl=100)
         assert classify_entity(w) == "unknown"
 
-    def test_parse_json_wallets(self) -> None:
+    def test_classify_entity_smart_money_takes_priority(self) -> None:
+        """VAL-DEX-002: smart_money takes priority over roi_whale and whale_unlabeled."""
+        from adapters.dextrabot import WalletData, classify_entity
+        w = WalletData(address="test", sharpe=2.0, win_rate=60.0, pnl=100000, growth_rate=300, tx_count=50)
+        assert classify_entity(w) == "smart_money"
+
+    def test_fetch_wallets_returns_whale_pnl_metric(self, tmp_path: Path) -> None:
+        """VAL-DEX-001: fetch_wallets returns DataPoints with whale_pnl metric."""
         from adapters.dextrabot import DextrabotAdapter
-        adapter = DextrabotAdapter()
-        html = '''<html><script>
-        {"wallets": [
-            {"address": "0xabc123", "pnl": "10000", "winRate": "65", "sharpe": "2.1", "leverage": "5"},
-            {"address": "0xdef456", "pnl": "-5000", "winRate": "40", "sharpe": "0.5"}
-        ]}
-        </script></html>'''
-        wallets = adapter._parse_wallets_html(html)
-        # JSON embedded in script may or may not match depending on regex
-        # This tests the graceful handling path
+
+        adapter = DextrabotAdapter(cache_dir=tmp_path)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = DEXT_FIXTURE_WALLETS
+        mock_response.text = json.dumps(DEXT_FIXTURE_WALLETS)
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(adapter._session, "get", return_value=mock_response):
+            points = adapter.fetch_wallets()
+
+        assert len(points) > 0
+        assert all(isinstance(p, DataPoint) for p in points)
+        assert all(p.metric == "whale_pnl" for p in points)
+        assert all(isinstance(p.value, float) and math.isfinite(p.value) for p in points)
+        assert all(p.provenance.source_name == "Dextrabot" for p in points)
+
+    def test_fetch_wallets_entity_types_in_attrs(self, tmp_path: Path) -> None:
+        """VAL-DEX-001: DataPoints contain entity_type in attrs."""
+        from adapters.dextrabot import DextrabotAdapter
+
+        adapter = DextrabotAdapter(cache_dir=tmp_path)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = DEXT_FIXTURE_WALLETS
+        mock_response.text = json.dumps(DEXT_FIXTURE_WALLETS)
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(adapter._session, "get", return_value=mock_response):
+            points = adapter.fetch_wallets()
+
+        entity_types = {p.attrs.get("entity_type") for p in points}
+        assert len(entity_types) > 0
+        # Should include smart_money (wallet 1), roi_whale (wallet 2), whale_unlabeled (wallet 3)
+        assert "smart_money" in entity_types
+        assert "roi_whale" in entity_types
+        assert "whale_unlabeled" in entity_types
+
+    def test_fetch_wallets_filter_params(self, tmp_path: Path) -> None:
+        """VAL-DEX-003: optimal filter params applied in request."""
+        from adapters.dextrabot import DextrabotAdapter, DEFAULT_FILTERS
+
+        adapter = DextrabotAdapter(cache_dir=tmp_path)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"count": 0, "results": []}
+        mock_response.text = '{"count": 0, "results": []}'
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(adapter._session, "get", return_value=mock_response) as mock_get:
+            adapter.fetch_wallets()
+
+        assert mock_get.called
+        call_args = mock_get.call_args
+        params = call_args[1].get("params", call_args.kwargs.get("params", {}))
+
+        # Verify all 6 optimal filters are present
+        assert params.get("period") == DEFAULT_FILTERS["period"]
+        assert params.get("min_pnl") == DEFAULT_FILTERS["min_pnl"]
+        assert params.get("min_win_complated_rate") == DEFAULT_FILTERS["min_win_complated_rate"]
+        assert params.get("min_complated_trades_count") == DEFAULT_FILTERS["min_complated_trades_count"]
+        assert params.get("order") == DEFAULT_FILTERS["order"]
+        assert params.get("coin") == DEFAULT_FILTERS["coin"]
+
+    def test_fetch_wallets_empty_response(self, tmp_path: Path) -> None:
+        """VAL-DEX-004: empty response returns [] gracefully."""
+        from adapters.dextrabot import DextrabotAdapter
+
+        adapter = DextrabotAdapter(cache_dir=tmp_path)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"count": 0, "next": None, "previous": None, "results": []}
+        mock_response.text = '{"count": 0, "next": null, "previous": null, "results": []}'
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(adapter._session, "get", return_value=mock_response):
+            points = adapter.fetch_wallets()
+
+        assert points == []
+
+    def test_fetch_wallets_connection_error_returns_empty(self, tmp_path: Path) -> None:
+        """VAL-DEX-004: connection error returns [] without raising."""
+        from adapters.dextrabot import DextrabotAdapter
+
+        adapter = DextrabotAdapter(cache_dir=tmp_path)
+        with patch.object(adapter._session, "get", side_effect=ConnectionError("timeout")):
+            points = adapter.fetch_wallets()
+
+        assert points == []
+
+    def test_parse_period(self) -> None:
+        from adapters.dextrabot import DextrabotAdapter
+        assert DextrabotAdapter._parse_period("7D") == 7
+        assert DextrabotAdapter._parse_period("30D") == 30
+        assert DextrabotAdapter._parse_period("1D") == 1
+        assert DextrabotAdapter._parse_period("14d") == 14
+        assert DextrabotAdapter._parse_period("invalid") == 7  # default
+
+    def test_map_sort(self) -> None:
+        from adapters.dextrabot import DextrabotAdapter
+        assert DextrabotAdapter._map_sort("roe") == "-margin_roi"
+        assert DextrabotAdapter._map_sort("pnl") == "-perp_pnl"
+        assert DextrabotAdapter._map_sort("unknown") == "-margin_roi"  # default
 
     def test_rate_limiter(self) -> None:
         from adapters.dextrabot import RateLimiter
@@ -63,8 +239,43 @@ class TestDextrabotAdapter:
         from adapters.dextrabot import ResponseCache
         cache = ResponseCache(tmp_path, ttl_seconds=60)
         assert cache.get("http://test.com") is None
-        cache.put("http://test.com", "<html>test</html>")
-        assert cache.get("http://test.com") == "<html>test</html>"
+        cache.put("http://test.com", '{"key": "value"}')
+        assert cache.get("http://test.com") == '{"key": "value"}'
+
+    def test_api_url_constant(self) -> None:
+        """Verify the discovered API endpoint URL is correct."""
+        from adapters.dextrabot import DEXT_API_URL
+        assert "dextradata.nftinit.io" in DEXT_API_URL
+        assert "get_wallets_profit_new" in DEXT_API_URL
+
+    def test_default_filters(self) -> None:
+        """Verify optimal default filter params."""
+        from adapters.dextrabot import DEFAULT_FILTERS
+        assert DEFAULT_FILTERS["period"] == 7
+        assert DEFAULT_FILTERS["order"] == "-margin_roi"
+        assert DEFAULT_FILTERS["coin"] == "SOL"
+        assert DEFAULT_FILTERS["min_pnl"] == 50000
+        assert DEFAULT_FILTERS["min_win_complated_rate"] == 55
+        assert DEFAULT_FILTERS["min_complated_trades_count"] == 30
+
+    def test_health_check(self) -> None:
+        from adapters.dextrabot import DextrabotAdapter
+        adapter = DextrabotAdapter()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        with patch.object(adapter._session, "get", return_value=mock_resp):
+            health = adapter.health_check()
+        assert health.name == "Dextrabot"
+        assert health.healthy is True
+
+    def test_health_check_failure(self) -> None:
+        from adapters.dextrabot import DextrabotAdapter
+        adapter = DextrabotAdapter()
+        with patch.object(adapter._session, "get", side_effect=ConnectionError("fail")):
+            health = adapter.health_check()
+        assert health.name == "Dextrabot"
+        assert health.healthy is False
+        assert health.error_message is not None
 
 
 # ---------------------------------------------------------------------------

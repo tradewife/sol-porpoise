@@ -1,4 +1,15 @@
-"""Dextrabot scraper adapter: web scraping with rate limiting and caching."""
+"""Dextrabot adapter: JSON API client for whale/smart-money wallet intelligence.
+
+API Discovery (2026-06-03):
+  Discovered via agent-browser Network tab on app.dextrabot.com/discover-wallets.
+  The SPA frontend calls a backend API at dextradata.nftinit.io which returns
+  paginated JSON with full wallet metrics (PnL, sharpe, win rate, growth rate,
+  drawdown, trade counts, open positions, etc.).
+
+  Endpoint: GET https://dextradata.nftinit.io/api/hyper/get_wallets_profit_new/
+  Auth: none (public)
+  Response: {"count": N, "next": "...", "previous": null, "results": [...]}
+"""
 
 from __future__ import annotations
 
@@ -11,10 +22,48 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from bs4 import BeautifulSoup, Tag
 
 from adapters.base import AdapterHealth, DataPoint, Provenance, SourceTier
 from adapters.normalizer import aest_now_iso, make_provenance
+
+
+# ---------------------------------------------------------------------------
+# API constants
+# ---------------------------------------------------------------------------
+
+DEXT_BASE_URL = "https://app.dextrabot.com"
+DEXT_API_URL = "https://dextradata.nftinit.io/api/hyper/get_wallets_profit_new/"
+
+# Discovered JSON API endpoint — replaces HTML scraping.
+# Public, no auth required. Paginated JSON response.
+DEXT_API_NOTE = (
+    "JSON API discovered 2026-06-03 via agent-browser. "
+    "Endpoint: GET https://dextradata.nftinit.io/api/hyper/get_wallets_profit_new/ "
+    "Params: period (days), order (-perp_pnl|-margin_roi), coin, min_pnl, "
+    "min_win_complated_rate, min_complated_trades_count, offset, limit. "
+    "Response: {count, next, previous, results: [{user_token, "
+    "portfolio_perp_week_pnl, portfolio_perp_week_sharpe, total_win_rate, "
+    "margin_roi, avg_uleverage_value, portfolio_perp_week_growth_rate, "
+    "portfolio_perp_week_dd, rtx_count, complated_trades_count, "
+    "win_complated_rate, open_positions, ...}]}"
+)
+
+# Default filter parameters for optimal whale discovery
+DEFAULT_FILTERS: dict[str, Any] = {
+    "period": 7,          # 7D lookback
+    "order": "-margin_roi",  # sort by ROE descending
+    "coin": "SOL",        # SOL-focused
+    "min_pnl": 50000,     # minimum $50k PnL
+    "min_win_complated_rate": 55,  # minimum 55% win rate
+    "min_complated_trades_count": 30,  # minimum 30 completed trades
+    "offset": 0,
+    "limit": 50,
+}
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -29,10 +78,12 @@ class WalletData:
     drawdown: float | None = None
     tx_count: int | None = None
     token_breakdown: list[dict[str, Any]] = field(default_factory=list)
-    entity_type: str = "unknown"  # smart_money, whale_unlabeled, unknown
+    entity_type: str = "unknown"  # smart_money, whale_unlabeled, roi_whale, unknown
 
 
-DEXT_BASE_URL = "https://app.dextrabot.com"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 class RateLimiter:
@@ -61,7 +112,7 @@ class ResponseCache:
         return hashlib.sha256(url.encode()).hexdigest()
 
     def get(self, url: str) -> str | None:
-        path = self.cache_dir / f"{self._cache_key(url)}.html"
+        path = self.cache_dir / f"{self._cache_key(url)}.json"
         if path.exists():
             age = time.time() - path.stat().st_mtime
             if age < self.ttl_seconds:
@@ -69,47 +120,71 @@ class ResponseCache:
         return None
 
     def put(self, url: str, content: str) -> None:
-        path = self.cache_dir / f"{self._cache_key(url)}.html"
+        path = self.cache_dir / f"{self._cache_key(url)}.json"
         path.write_text(content, encoding="utf-8")
 
 
 def classify_entity(wallet: WalletData) -> str:
-    """Classify wallet as smart_money, whale_unlabeled, or unknown."""
+    """Classify wallet as smart_money, whale_unlabeled, roi_whale, or unknown.
+
+    Priority order:
+      1. smart_money  — sharpe > 1.5 AND win_rate > 55
+      2. roi_whale    — growth_rate > 200 AND tx_count > 30
+      3. whale_unlabeled — |pnl| > 10000
+      4. unknown
+    """
     if wallet.sharpe is not None and wallet.sharpe > 1.5:
         if wallet.win_rate is not None and wallet.win_rate > 55:
             return "smart_money"
+    if wallet.growth_rate is not None and wallet.growth_rate > 200:
+        if wallet.tx_count is not None and wallet.tx_count > 30:
+            return "roi_whale"
     if wallet.pnl is not None and abs(wallet.pnl) > 10000:
         return "whale_unlabeled"
     return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Adapter
+# ---------------------------------------------------------------------------
+
+
 class DextrabotAdapter:
-    """Scrapes Dextrabot for whale/smart-money wallet intelligence."""
+    """JSON API client for Dextrabot whale/smart-money wallet intelligence.
+
+    Uses direct JSON API at dextradata.nftinit.io (discovered 2026-06-03)
+    instead of HTML scraping. Falls back gracefully on empty/error responses.
+    """
 
     def __init__(
         self,
         base_url: str = DEXT_BASE_URL,
+        api_url: str = DEXT_API_URL,
         cache_dir: str | Path = "data/raw",
         cache_ttl: int = 300,
         rate_limit: int = 10,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.api_url = api_url.rstrip("/")
         self.rate_limiter = RateLimiter(max_requests=rate_limit)
         self.cache = ResponseCache(cache_dir, ttl_seconds=cache_ttl)
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "ImperialAgent/0.1"})
+        self._session.headers.update({
+            "User-Agent": "ImperialAgent/0.1",
+            "Accept": "application/json",
+        })
 
     def provenance(self) -> Provenance:
         return make_provenance(
             source_name="Dextrabot",
             source_tier=SourceTier.OPEN,
-            source_link=self.base_url,
+            source_link=self.api_url,
             confidence=0.70,
         )
 
     def health_check(self) -> AdapterHealth:
         try:
-            r = self._session.get(self.base_url, timeout=10)
+            r = self._session.get(self.api_url, params={"limit": 1}, timeout=10)
             return AdapterHealth(
                 name="Dextrabot", healthy=r.status_code == 200,
                 last_success_ts=aest_now_iso(),
@@ -128,107 +203,121 @@ class DextrabotAdapter:
         coin: str | None = None,
         period: str = "7D",
         min_pnl: float | None = None,
+        min_win_rate: float | None = None,
+        min_trades: int | None = None,
+        sort_by: str = "roe",
+        limit: int = 50,
     ) -> list[DataPoint]:
-        """Fetch and parse wallet data from Dextrabot discover-wallets page."""
-        url = f"{self.base_url}/discover-wallets"
-        params: dict[str, str] = {}
-        if coin:
-            params["coin"] = coin.upper()
-        if period:
-            params["period"] = period
+        """Fetch wallet data from Dextrabot JSON API.
 
-        cache_key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        html = self.cache.get(cache_key)
+        Uses optimal filter params by default:
+          period=7D, min_pnl=50000, min_win_rate=55, min_trades=30,
+          sort_by=roe, coin=SOL.
 
-        if html is None:
-            self.rate_limiter.wait()
+        Args:
+            coin: Filter by coin (e.g. "SOL"). Defaults to "SOL" via DEFAULT_FILTERS.
+            period: Lookback period (e.g. "7D" → API uses 7 days). Defaults to "7D".
+            min_pnl: Minimum PnL filter. Defaults to 50000.
+            min_win_rate: Minimum win rate filter. Defaults to 55.
+            min_trades: Minimum completed trades filter. Defaults to 30.
+            sort_by: Sort order — "roe" maps to -margin_roi, "pnl" to -perp_pnl.
+            limit: Max number of results to return.
+        """
+        # Parse period string to days integer for the API
+        period_days = self._parse_period(period)
+
+        # Build API query params with optimal defaults
+        params: dict[str, Any] = dict(DEFAULT_FILTERS)
+        params["period"] = period_days
+        params["coin"] = coin or DEFAULT_FILTERS["coin"]
+        params["limit"] = limit
+
+        if min_pnl is not None:
+            params["min_pnl"] = min_pnl
+        if min_win_rate is not None:
+            params["min_win_complated_rate"] = min_win_rate
+        if min_trades is not None:
+            params["min_complated_trades_count"] = min_trades
+
+        # Map sort_by to API order param
+        params["order"] = self._map_sort(sort_by)
+
+        # Remove empty-string params (API uses absent params vs empty)
+        clean_params = {k: v for k, v in params.items() if v not in (None, "")}
+
+        # Build cache key from the request URL
+        cache_key = self.api_url + "?" + "&".join(
+            f"{k}={v}" for k, v in sorted(clean_params.items())
+        )
+
+        # Try cache first
+        cached = self.cache.get(cache_key)
+        if cached is not None:
             try:
-                r = self._session.get(url, params=params, timeout=30)
-                r.raise_for_status()
-                html = r.text
-                self.cache.put(cache_key, html)
-            except Exception as e:
-                # Return empty on failure
-                return []
+                data = json.loads(cached)
+                return self._parse_api_response(data)
+            except (json.JSONDecodeError, KeyError):
+                pass  # Fall through to live fetch
 
-        wallets = self._parse_wallets_html(html)
+        # Live API request
+        self.rate_limiter.wait()
+        try:
+            r = self._session.get(self.api_url, params=clean_params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            self.cache.put(cache_key, r.text)
+            return self._parse_api_response(data)
+        except Exception:
+            return []
+
+    def _parse_api_response(self, data: dict[str, Any]) -> list[DataPoint]:
+        """Parse the JSON API response into DataPoints."""
+        results = data.get("results", [])
+        if not results:
+            return []
+
+        wallets: list[WalletData] = []
+        for entry in results:
+            wallet = self._parse_wallet_entry(entry)
+            if wallet is not None:
+                wallets.append(wallet)
+
         return self._wallets_to_datapoints(wallets)
 
-    def _parse_wallets_html(self, html: str) -> list[WalletData]:
-        """Parse Dextrabot discover-wallets HTML to extract wallet data.
+    def _parse_wallet_entry(self, entry: dict[str, Any]) -> WalletData | None:
+        """Parse a single API result entry into WalletData.
 
-        Handles HTML structure changes gracefully.
+        API field mapping:
+          user_token → address
+          portfolio_perp_week_pnl → pnl (period-aware)
+          total_unrealized_pnl → unrealized_pnl
+          win_complated_rate or total_win_rate → win_rate
+          portfolio_perp_week_sharpe → sharpe
+          avg_uleverage_value → leverage
+          portfolio_perp_week_growth_rate → growth_rate
+          portfolio_perp_week_dd → drawdown
+          rtx_count → tx_count
         """
-        wallets: list[WalletData] = []
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            # Try to find wallet table or list
-            rows = soup.select("table tbody tr, [class*='wallet'], [class*='row']")
-            if not rows:
-                # Try JSON embedded in script tags
-                for script in soup.find_all("script"):
-                    text = script.string or ""
-                    if "wallet" in text.lower() and "pnl" in text.lower():
-                        # Try to extract JSON
-                        json_match = re.search(r'\{.*"wallets".*\}', text, re.DOTALL)
-                        if json_match:
-                            try:
-                                data = json.loads(json_match.group())
-                                for w in data.get("wallets", []):
-                                    wallets.append(self._parse_wallet_dict(w))
-                            except json.JSONDecodeError:
-                                pass
-                return wallets
-
-            for row in rows:
-                try:
-                    wallet = self._parse_wallet_row(row)
-                    if wallet:
-                        wallets.append(wallet)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        return wallets
-
-    def _parse_wallet_dict(self, data: dict[str, Any]) -> WalletData:
-        wallet = WalletData(
-            address=data.get("address", data.get("wallet", "unknown")),
-            pnl=self._safe_float(data.get("pnl", data.get("realizedPnl"))),
-            unrealized_pnl=self._safe_float(data.get("uPnl", data.get("unrealizedPnl"))),
-            win_rate=self._safe_float(data.get("winRate", data.get("win_rate"))),
-            sharpe=self._safe_float(data.get("sharpe", data.get("sharpeRatio"))),
-            leverage=self._safe_float(data.get("leverage")),
-            growth_rate=self._safe_float(data.get("growthRate", data.get("growth"))),
-            drawdown=self._safe_float(data.get("drawdown")),
-            tx_count=self._safe_int(data.get("txCount", data.get("tx_count"))),
-        )
-        wallet.entity_type = classify_entity(wallet)
-        return wallet
-
-    def _parse_wallet_row(self, row: Tag) -> WalletData | None:
-        """Parse a single HTML table row or card into WalletData."""
-        cells = row.find_all("td") if row.name == "tr" else [row]
-        if not cells:
+        address = entry.get("user_token", "unknown")
+        if address == "unknown":
             return None
 
-        text = " ".join(c.get_text(strip=True) for c in cells)
+        # Win rate: prefer completed win rate, fall back to total
+        win_rate = self._safe_float(
+            entry.get("win_complated_rate") or entry.get("total_win_rate")
+        )
 
-        # Extract address (looks like 0x... or Solana base58)
-        addr_match = re.search(r'(0x[a-fA-F0-9]{8,}|[1-9A-HJ-NP-Za-km-z]{32,})', text)
-        address = addr_match.group(1) if addr_match else "unknown"
-
-        # Try to extract numeric values
-        numbers = re.findall(r'-?[\d.]+', text)
-
-        wallet = WalletData(address=address)
-        if len(numbers) >= 1:
-            wallet.pnl = self._safe_float(numbers[0])
-        if len(numbers) >= 2:
-            wallet.win_rate = self._safe_float(numbers[1])
-        if len(numbers) >= 3:
-            wallet.sharpe = self._safe_float(numbers[2])
+        wallet = WalletData(
+            address=address,
+            pnl=self._safe_float(entry.get("portfolio_perp_week_pnl")),
+            unrealized_pnl=self._safe_float(entry.get("total_unrealized_pnl")),
+            win_rate=win_rate,
+            sharpe=self._safe_float(entry.get("portfolio_perp_week_sharpe")),
+            leverage=self._safe_float(entry.get("avg_uleverage_value")),
+            growth_rate=self._safe_float(entry.get("portfolio_perp_week_growth_rate")),
+            drawdown=self._safe_float(entry.get("portfolio_perp_week_dd")),
+            tx_count=self._safe_int(entry.get("rtx_count")),
+        )
         wallet.entity_type = classify_entity(wallet)
         return wallet
 
@@ -246,6 +335,10 @@ class DextrabotAdapter:
                 attrs["win_rate"] = w.win_rate
             if w.leverage is not None:
                 attrs["leverage"] = w.leverage
+            if w.growth_rate is not None:
+                attrs["growth_rate"] = w.growth_rate
+            if w.tx_count is not None:
+                attrs["tx_count"] = w.tx_count
 
             if w.pnl is not None:
                 points.append(DataPoint(
@@ -256,6 +349,27 @@ class DextrabotAdapter:
                     attrs=attrs,
                 ))
         return points
+
+    @staticmethod
+    def _parse_period(period: str) -> int:
+        """Parse period string (e.g. '7D', '30D', '1D') to days integer."""
+        match = re.match(r"(\d+)[Dd]?", period)
+        if match:
+            return int(match.group(1))
+        return 7  # default to 7 days
+
+    @staticmethod
+    def _map_sort(sort_by: str) -> str:
+        """Map sort_by name to API order parameter."""
+        mapping = {
+            "roe": "-margin_roi",
+            "pnl": "-perp_pnl",
+            "sharpe": "-perp_sharpe",
+            "win_rate": "-win_complated_rate",
+            "growth_rate": "-perp_growth_rate",
+            "trades": "-complated_trades_count",
+        }
+        return mapping.get(sort_by, "-margin_roi")
 
     @staticmethod
     def _safe_float(val: Any) -> float | None:

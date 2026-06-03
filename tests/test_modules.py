@@ -25,7 +25,7 @@ DEXT_FIXTURE_WALLETS = {
     "previous": None,
     "results": [
         {
-            "user_token": "0xabc1230000000000000000000000000000000001",
+            "user_token": "TEST_WALLET_PLACEHOLDER",
             "portfolio_perp_week_pnl": "125000.50",
             "total_unrealized_pnl": "5000.00",
             "win_complated_rate": "65.0",
@@ -38,7 +38,7 @@ DEXT_FIXTURE_WALLETS = {
             "margin_roi": 150.2,
         },
         {
-            "user_token": "0xdef4560000000000000000000000000000000002",
+            "user_token": "TEST_WALLET_PLACEHOLDER",
             "portfolio_perp_week_pnl": "-80000.25",
             "total_unrealized_pnl": "-2000.00",
             "win_complated_rate": "40.0",
@@ -51,7 +51,7 @@ DEXT_FIXTURE_WALLETS = {
             "margin_roi": 4461.4,
         },
         {
-            "user_token": "0x7890000000000000000000000000000000000003",
+            "user_token": "TEST_WALLET_PLACEHOLDER",
             "portfolio_perp_week_pnl": "55000.75",
             "total_unrealized_pnl": "1000.00",
             "win_complated_rate": "30.0",

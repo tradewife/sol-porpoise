@@ -48,7 +48,9 @@ echo "AI bridge: calling droid exec for prompt_id=$PROMPT_ID" >&2
 # It reads the prompt file and outputs the JSON response to stdout.
 # We use --auto low so droid can write the response file itself if needed,
 # but we capture stdout as the primary output path.
-RESPONSE_JSON=$(droid exec \
+DROID_BIN="${DROID_BIN:-/home/kt/.local/bin/droid}"
+
+RESPONSE_JSON=$("$DROID_BIN" exec \
     --model "custom:GLM-5.1-[Z.AI-Coding-Plan]---Openai-0" \
     --reasoning-effort high \
     --auto low \

@@ -431,6 +431,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
     import adapters.dextrabot as dext_mod
     import engine.kg as kg_mod
     import engine.scoring as scoring_mod
+    from engine.scoring import COMPONENT_WEIGHTS
     import engine.paper_orders as po_mod
     import engine.outcomes as outcomes_mod
     import engine.risk as risk_mod
@@ -761,7 +762,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
         }
 
         # Skip if no directional data
-        if score.weighted_score == 0 and len(score.unknown_components) == 9:
+        if score.weighted_score == 0 and len(score.unknown_components) >= len(COMPONENT_WEIGHTS):
             continue
 
         kg.add(
@@ -974,7 +975,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
             ss = signal_summary.get(sym)
             if ss:
                 unknowns = ss["score"].unknown_components if "score" in ss else []
-                if len(unknowns) == 9:
+                if len(unknowns) >= len(scoring_mod.COMPONENT_WEIGHTS):
                     no_pb_reasons.append(f"{sym}: all signals unknown (no data fetched)")
                 else:
                     active = [k for k, v in ss["components"].items() if v.label != "unknown"]
@@ -1041,7 +1042,7 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
         "### Assumptions\n"
         "- Market data from Imperial API (public endpoints)\n"
         "- Stop distance: ATR-based (0.8×ATR floor via compute_min_stop)\n"
-        "- Signal extraction: 9 components via extract_signals() from engine/signals.py\n"
+        f"- Signal extraction: {len(COMPONENT_WEIGHTS)} components via extract_signals() from engine/signals.py\n"
         "- Candle data: built from mark-price DataPoints (flat OHLC candles)\n"
         "- Playbook generation: 7 setup types via generate_playbooks() from engine/playbooks.py\n\n"
         "### Gaps\n"
@@ -1579,6 +1580,17 @@ def _run_ai_paper(account_id: str = "ai") -> int:
                 print(f"[{run_id}] Hawk: {len(_ai_whale_points)} whale datapoints for SM tilt")
         except Exception as e:
             print(f"[{run_id}] Hawk: Dextrabot unavailable for SM tilt: {e}")
+
+        # Collect whale cohort data from Hyperdash
+        try:
+            import adapters.hyperdash as _hdash_mod
+            _hdash = _hdash_mod.HyperdashAdapter()
+            _hdash_points = _hdash.fetch_cohorts()
+            if _hdash_points:
+                _ai_whale_points.extend(_hdash_points)
+                print(f"[{run_id}] Hawk: {len(_hdash_points)} Hyperdash cohort datapoints")
+        except Exception as e:
+            print(f"[{run_id}] Hawk: Hyperdash unavailable: {e}")
 
         # Fetch candles via HyperliquidAdapter with cache
         _hl_adapter = _hl_mod.HyperliquidAdapter()

@@ -964,3 +964,77 @@ class TestRunScanWiring:
         assert "parse_perps_markets" not in content
         assert "parse_perps_positions" not in content
         assert "parse_account_summary" not in content
+
+
+# ---------------------------------------------------------------------------
+# Hyperdash adapter wiring in AI paper path
+# ---------------------------------------------------------------------------
+
+class TestHyperdashAIWiring:
+    """Verify HyperdashAdapter is wired into the AI paper scan path."""
+
+    def test_hyperdash_import_in_ai_paper_path(self) -> None:
+        """run_scan.py imports HyperdashAdapter in the AI paper section."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        assert "adapters.hyperdash" in content
+
+    def test_hyperdash_fetch_cohorts_called(self) -> None:
+        """run_scan.py calls fetch_cohorts() on HyperdashAdapter."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        assert "fetch_cohorts" in content
+
+    def test_hyperdash_points_appended_to_whale_points(self) -> None:
+        """Hyperdash DataPoints are appended to _ai_whale_points."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        # Verify extend call on _ai_whale_points with hyperdash points
+        assert "_ai_whale_points.extend(_hdash_points)" in content
+
+    def test_hyperdash_graceful_degradation(self) -> None:
+        """Hyperdash fetch is wrapped in try/except for graceful degradation."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        # Find the Hyperdash block and verify error handling
+        assert "Hyperdash unavailable" in content
+
+    def test_hyperdash_not_in_deterministic_path(self) -> None:
+        """HyperdashAdapter is NOT wired in the deterministic path."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        # The deterministic path uses 'whale_datapoints' (not '_ai_whale_points')
+        # Verify 'hyperdash' does not appear near deterministic whale collection
+        # by checking that HyperdashAdapter import is only in _run_ai_paper
+        lines = content.split("\n")
+        in_ai_paper = False
+        in_deterministic = False
+        hyperdash_in_deterministic = False
+        for line in lines:
+            if "_run_ai_paper" in line and "def " in line:
+                in_ai_paper = True
+                in_deterministic = False
+            if "run_deterministic" in line and "def " in line:
+                in_deterministic = True
+                in_ai_paper = False
+            if "hyperdash" in line.lower() and in_deterministic:
+                hyperdash_in_deterministic = True
+        assert not hyperdash_in_deterministic, "HyperdashAdapter should not appear in deterministic path"
+
+    def test_hyperdash_adapter_fetch_cohorts_is_sync(self) -> None:
+        """HyperdashAdapter.fetch_cohorts() is a synchronous method."""
+        from adapters.hyperdash import HyperdashAdapter
+        import inspect
+        assert not inspect.iscoroutinefunction(HyperdashAdapter.fetch_cohorts)
+
+    def test_hyperdash_adapter_returns_empty_on_failure(self) -> None:
+        """HyperdashAdapter.fetch_cohorts() returns [] on failure."""
+        from adapters.hyperdash import HyperdashAdapter
+        adapter = HyperdashAdapter(graphql_url="http://localhost:99999/nonexistent")
+        result = adapter.fetch_cohorts()
+        assert result == []

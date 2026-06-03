@@ -849,7 +849,7 @@ class TestReportSectionHGaps:
     def test_section_h_no_stale_signals_gap(self) -> None:
         """Section H should NOT list 'signals mostly unknown' as a gap."""
         source = (Path(__file__).resolve().parent.parent / "engine" / "run_scan.py").read_text()
-        assert "Signal extraction: 9 components via extract_signals" in source, \
+        assert ("Signal extraction:" in source and "components via extract_signals" in source), \
             "Section H should reflect real signal extraction, not unknown placeholder"
 
     def test_section_h_lists_remaining_catalyst_gap(self) -> None:

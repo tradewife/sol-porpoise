@@ -169,6 +169,20 @@ class HyperdashAdapter:
         SOL-only filter applied.
         Returns empty list on any failure.
         """
+        return self.fetch_cohorts()
+
+    def fetch_cohorts(self) -> list[DataPoint]:
+        """Synchronous fetch of whale cohort data from Hyperdash GraphQL API.
+
+        Returns DataPoints with metrics:
+          - whale_cohort_long_pct: float (0-100)
+          - cohort_direction: "long" | "short" | "neutral"
+          - cohort_oi_usd: float (aggregate SOL OI in USD)
+
+        For each of 2 target tiers (whale, large).
+        SOL-only filter applied.
+        Returns empty list on any failure.
+        """
         try:
             r = self._client.post(
                 self.graphql_url,

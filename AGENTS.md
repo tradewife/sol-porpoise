@@ -26,7 +26,7 @@ Before making changes, read:
 
 Two parallel accounts run hourly via `cron_hourly.sh`:
 
-- **Deterministic** (`accounts/deterministic/`) -- 14-step scan: data fetch -> 9 signals -> scoring -> playbooks -> risk sizing -> Vulcan execution
+- **Deterministic** (`accounts/deterministic/`) -- 14-step scan: data fetch -> 10 signals -> scoring -> playbooks -> risk sizing -> Vulcan execution
 - **AI** (`accounts/ai/`) -- data fetch -> prompt + skills -> `droid exec` (GLM-5.1) -> validate prompt-bound response -> risk sizing -> Vulcan execution
 
 Both fall back to synthetic paper_orders.csv when Vulcan is unavailable.
@@ -49,18 +49,30 @@ When `vulcan` CLI is installed, trades execute via `adapters/vulcan.py`:
 
 ### Trading Skills
 
-10 repo-local skills loaded at runtime from `skills/<name>/SKILL.md`. Add new skills by creating the SKILL.md and listing in `config/ai_agent.yaml` under `skills.enabled`.
+11 repo-local skills loaded at runtime from `skills/<name>/SKILL.md`. Add new skills by creating the SKILL.md and listing in `config/ai_agent.yaml` under `skills.enabled`.
 
 ### Hawk Breakout Integration
 
 The hawk breakout pipeline adds deterministic breakout detection to the AI paper trading path:
 
-- **`engine/hawk_breakout.py`** -- Deterministic 7-day breakout signal with Smart Money tilt gating and 0-9 scoring (Senpi Hawk v1.0.0). Runs in `ai-paper` mode only, before prompt building.
+- **`engine/hawk_breakout.py`** -- Deterministic 7-day breakout signal with Smart Money tilt gating and 0-9 scoring (Senpi Hawk v1.0.0). Runs in `ai-paper` mode only, before prompt building. Candle history (168 hourly + 42 four-hourly) wired from Hyperliquid API -- produces live 0-9 scores.
 - **`skills/market-structure-context/SKILL.md`** -- AI skill that teaches the agent to classify HTF regime (trending_up, trending_down, ranging, compression, unknown) from the Market Data table, produce alignment scores, and gate breakouts through structureConfirmed/partial/rejected.
 - **`skills/hawk-breakout/SKILL.md`** -- AI skill that teaches the agent to interpret pre-computed hawk signals in the prompt, including hard veto rules and scoring interpretation.
 - Both skills are listed in `config/ai_agent.yaml` under `skills.enabled` at positions 3 and 4.
 - **`config/strategy.yaml`** -- Holds hawk breakout parameters (lookback, SM tilt thresholds, scoring weights, volume multiplier). The module works without this file via Python defaults.
-- **Current limitation:** Hawk signals currently return "none" because only a single mark-price snapshot is available. The 7-day breakout gate requires 168 hourly candle closes, which are not yet wired in. The gate fails gracefully (no signal produced, no crash).
+- **Candle data** is fetched from Hyperliquid API (`candleSnapshot`), cached at `accounts/<id>/data/candles_SOL_1h.json` with 55-minute TTL, and wired into both deterministic and AI scan paths.
+
+### Data Layer
+
+- **Hyperliquid Direct API** (`adapters/hyperliquid.py`) -- Replaces Phantom MCP. Direct HTTP POST to `api.hyperliquid.xyz/info`. Provides markets, funding, OI, L2 orderbook (book_imbalance_ratio), and candle data.
+- **Hyperdash GraphQL** (`adapters/hyperdash.py`) -- Whale cohort directional bias. Used in AI path only.
+- **Dextrabot** (`adapters/dextrabot.py`) -- Whale wallet intelligence via direct JSON API (`dextradata.nftinit.io`). Includes `smart_money`, `whale_unlabeled`, and `roi_whale` tiers.
+- **Imperial API** (`adapters/imperial.py`) -- Mark prices, funding rates, volume, OI, depth (primary data source for deterministic path, fallback for AI path).
+
+### Signal Pipeline
+
+- 10 signal extractors in `engine/signals.py`: funding_stretch, oi_delta, basis, liquidity_magnet, session_structure, whale_evidence, dex_perp_lag, volatility, catalyst, **book_imbalance**
+- Weights in `engine/scoring.py` sum to 1.0 and are FIXED (never adjusted by outcomes)
 
 ## Learning Observer, Not Timid Trader
 

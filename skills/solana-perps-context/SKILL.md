@@ -1,6 +1,6 @@
 # Solana Perps Context
 
-When Imperial, Flash Trade, Jupiter, Phoenix, Phantom, or other Solana-native data is present:
+When Imperial, Flash Trade, Jupiter, Phoenix, Hyperliquid, or other Solana-native data is present:
 
 - Treat Solana venue data as primary for Solana perps execution context.
 - Watch pool utilization and max leverage as liquidity/risk constraints.

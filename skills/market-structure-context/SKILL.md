@@ -23,7 +23,7 @@ This skill fires at reasoning time, not at data-collection time.
 | Market Data table | mcp_data.py | Price, funding rate, OI, 24h volume, max leverage, pool utilisation |
 | ATR Estimates | mcp_data.py | 1.5%-of-price ATR proxy per symbol |
 | Account | mcp_data.py | Paper equity, available USDC, max concurrent trades |
-| Existing Positions | run_scan.py Phantom call | Open positions with entry, size, unrealised PnL |
+| Existing Positions | run_scan.py HyperliquidAdapter call | Open positions with entry, size, unrealised PnL |
 | Prior Signal Performance | run_scan.py | Per-signal hit rate, avg R -- informational only |
 | Hawk Breakout Signals | run_scan.py (when present) | Pre-computed breakout signal per symbol from engine/hawk_breakout.py |
 

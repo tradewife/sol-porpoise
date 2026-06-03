@@ -8,7 +8,7 @@ In each trade object:
 - `risk_notes`: name the main thing that would make the setup fail.
 - `data_gaps`: list missing data that reduces confidence.
 
-Do not cite data sources that are not present. If only Imperial fallback data is present, do not claim MCP, Hyperliquid-native, Dextrabot, or Phantom evidence.
+Do not cite data sources that are not present. If only Imperial fallback data is present, do not claim MCP, Hyperliquid-native, Dextrabot, or Hyperliquid whale evidence.
 
 If evidence is thin, use lower probability or return no trade.
 

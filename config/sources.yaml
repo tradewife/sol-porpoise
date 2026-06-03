@@ -113,13 +113,14 @@ fallback_order:
       - trading_data
       - leverage_info
 
-  - name: "Phantom MCP (Hyperliquid)"
+  - name: "Hyperliquid Direct API"
     tier: HL-native
     data_types:
       - perps_markets
       - funding
       - prices
-      - positions
+      - orderbook
+      - candles
 
   # Cross-venue reference
   - name: "Binance public API"

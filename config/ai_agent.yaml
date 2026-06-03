@@ -72,11 +72,12 @@ skills:
     - market-structure-context     # 3. HTF regime gate and breakout reading lens
     - hawk-breakout                # 4. Breakout signal outputs (AI-readable)
     - hyperliquid-microstructure   # 5. HL-specific microstructure patterns
-    - whale-leaderboard-intel      # 6. Whale/leaderboard corroboration
-    - risk-execution-rails         # 7. Hard numeric constraints
-    - provenance-auditor           # 8. Evidence integrity check
-    - outcome-learning             # 9. Prior outcomes context
-    - twitter-ct-intel             # 10. Soft CT sentiment
+    - orderbook-liquidity          # 6. Orderbook depth and book imbalance interpretation
+    - whale-leaderboard-intel      # 7. Whale/leaderboard corroboration (3 source tiers)
+    - risk-execution-rails         # 8. Hard numeric constraints
+    - provenance-auditor           # 9. Evidence integrity check
+    - outcome-learning             # 10. Prior outcomes context
+    - twitter-ct-intel             # 11. Soft CT sentiment
   max_chars_per_skill: 2500
   fail_on_missing_core_skill: true
 

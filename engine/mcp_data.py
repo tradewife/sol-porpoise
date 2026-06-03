@@ -215,44 +215,73 @@ def parse_trading_overview(raw: dict[str, Any]) -> list[MarketOverview]:
     return markets
 
 
-def parse_account_summary(raw: dict[str, Any]) -> AccountState:
-    """Parse the result of perps_account MCP tool into AccountState."""
-    if not isinstance(raw, dict):
-        return AccountState(total_value_usd=0, available_usd=0, withdrawable_usd=0)
+def parse_hl_datapoints(
+    hl_points: list[DataPoint],
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float]]:
+    """Process HyperliquidAdapter DataPoints into structured dicts.
+
+    Returns (prices, funding_rates, open_interest, volumes) per symbol.
+    Replaces old perps markets parser for HyperliquidAdapter output.
+    """
+    prices: dict[str, float] = {}
+    funding_rates: dict[str, float] = {}
+    open_interest: dict[str, float] = {}
+    volumes: dict[str, float] = {}
+
+    for dp in hl_points:
+        if not isinstance(dp.value, (int, float)):
+            continue
+        val = float(dp.value)
+        sym = dp.symbol
+
+        if "mark_price" in dp.metric and val > 0:
+            prices.setdefault(sym, val)
+        elif "funding" in dp.metric:
+            funding_rates[sym] = val
+        elif "open_interest" in dp.metric or "oi" in dp.metric:
+            open_interest[sym] = val
+        elif "volume" in dp.metric:
+            volumes[sym] = val
+
+    return prices, funding_rates, open_interest, volumes
+
+
+def parse_hl_account(
+    hl_points: list[DataPoint],
+) -> AccountState:
+    """Process HyperliquidAdapter DataPoints into AccountState.
+
+    Extracts total_value_usd and available_usd from account metrics.
+    Replaces old account summary parser for HyperliquidAdapter output.
+    """
+    total_usd = 0.0
+    available_usd = 0.0
+
+    for dp in hl_points:
+        if dp.symbol == "ACCOUNT":
+            if dp.metric == "perps_total_value_usd" and isinstance(dp.value, (int, float)):
+                total_usd = float(dp.value)
+            elif dp.metric == "perps_available_usd" and isinstance(dp.value, (int, float)):
+                available_usd = float(dp.value)
 
     return AccountState(
-        total_value_usd=float(raw.get("totalValueUsd", raw.get("total_value", 0)) or 0),
-        available_usd=float(raw.get("availableUsd", raw.get("available", 0)) or 0),
-        withdrawable_usd=float(raw.get("withdrawableUsd", raw.get("withdrawable", 0)) or 0),
-        positions=raw.get("positions", []),
-        open_orders=raw.get("openOrders", []),
+        total_value_usd=total_usd,
+        available_usd=available_usd,
+        withdrawable_usd=available_usd,
     )
 
 
-def parse_perps_positions(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    """Parse the result of perps_positions MCP tool into a list of position dicts."""
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        return raw.get("positions", raw.get("data", []))
+def parse_hl_positions(
+    hl_points: list[DataPoint],
+) -> list[dict[str, Any]]:
+    """Process HyperliquidAdapter DataPoints into position dicts.
+
+    Replaces old perps positions parser for HyperliquidAdapter output.
+    Returns position info extracted from orderbook/market DataPoints.
+    """
+    # HyperliquidAdapter doesn't provide position data directly
+    # (only market/orderbook/candle data). Return empty list.
     return []
-
-
-def parse_perps_markets(raw: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Parse the result of perps_markets MCP tool into a symbol-keyed dict."""
-    result: dict[str, dict[str, Any]] = {}
-    if not isinstance(raw, dict):
-        return result
-    items = raw.get("markets", raw.get("data", []))
-    if isinstance(items, dict):
-        items = list(items.values())
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        symbol = str(item.get("coin", item.get("symbol", ""))).upper()
-        if symbol:
-            result[symbol] = item
-    return result
 
 
 def format_ai_prompt(

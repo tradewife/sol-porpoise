@@ -19,9 +19,9 @@ from engine.mcp_data import (
     format_ai_prompt,
     format_hawk_prompt_section,
     overview_to_datapoints,
-    parse_account_summary,
-    parse_perps_markets,
-    parse_perps_positions,
+    parse_hl_account,
+    parse_hl_datapoints,
+    parse_hl_positions,
     parse_trading_overview,
 )
 
@@ -66,73 +66,72 @@ class TestParseTradingOverview:
 
 
 # ---------------------------------------------------------------------------
-# parse_account_summary
+# parse_hl_datapoints
 # ---------------------------------------------------------------------------
 
 
-class TestParseAccountSummary:
-    def test_valid(self):
-        raw = {"totalValueUsd": 1000, "availableUsd": 800, "withdrawableUsd": 750}
-        result = parse_account_summary(raw)
+class TestParseHlDatapoints:
+    def test_extracts_prices_funding_oi(self):
+        from adapters.base import DataPoint, Provenance, SourceTier
+        prov = Provenance(
+            source_name="HL", source_tier=SourceTier.HL_NATIVE,
+            source_link="", source_ts="", fetched_ts_aest="", confidence=0.9,
+        )
+        points = [
+            DataPoint(symbol="SOL", metric="mark_price_hl", value=150.0, provenance=prov),
+            DataPoint(symbol="SOL", metric="funding_rate_hl", value=0.001, provenance=prov),
+            DataPoint(symbol="SOL", metric="open_interest_hl", value=50000.0, provenance=prov),
+            DataPoint(symbol="BTC", metric="mark_price_hl", value=100000.0, provenance=prov),
+        ]
+        prices, funding, oi, vol = parse_hl_datapoints(points)
+        assert prices["SOL"] == 150.0
+        assert prices["BTC"] == 100000.0
+        assert funding["SOL"] == 0.001
+        assert oi["SOL"] == 50000.0
+
+    def test_empty_list(self):
+        prices, funding, oi, vol = parse_hl_datapoints([])
+        assert prices == {}
+        assert funding == {}
+        assert oi == {}
+        assert vol == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_hl_account
+# ---------------------------------------------------------------------------
+
+
+class TestParseHlAccount:
+    def test_extracts_account_metrics(self):
+        from adapters.base import DataPoint, Provenance, SourceTier
+        prov = Provenance(
+            source_name="HL", source_tier=SourceTier.HL_NATIVE,
+            source_link="", source_ts="", fetched_ts_aest="", confidence=0.9,
+        )
+        points = [
+            DataPoint(symbol="ACCOUNT", metric="perps_total_value_usd", value=1000.0, provenance=prov),
+            DataPoint(symbol="ACCOUNT", metric="perps_available_usd", value=800.0, provenance=prov),
+        ]
+        result = parse_hl_account(points)
         assert result.total_value_usd == 1000.0
         assert result.available_usd == 800.0
-        assert result.withdrawable_usd == 750.0
 
-    def test_missing_fields(self):
-        raw = {}
-        result = parse_account_summary(raw)
+    def test_empty_points(self):
+        result = parse_hl_account([])
         assert result.total_value_usd == 0.0
-
-    def test_non_dict(self):
-        result = parse_account_summary("not a dict")
-        assert result.total_value_usd == 0.0
+        assert result.available_usd == 0.0
 
 
 # ---------------------------------------------------------------------------
-# parse_perps_positions
+# parse_hl_positions
 # ---------------------------------------------------------------------------
 
 
-class TestParsePerpsPositions:
-    def test_list(self):
-        raw = [{"coin": "BTC", "side": "long", "sizeUsd": 500}]
-        result = parse_perps_positions(raw)
-        assert len(result) == 1
-
-    def test_dict_with_positions(self):
-        raw = {"positions": [{"coin": "ETH", "side": "short"}]}
-        result = parse_perps_positions(raw)
-        assert len(result) == 1
-
-    def test_empty(self):
-        assert parse_perps_positions({}) == []
-        assert parse_perps_positions([]) == []
-
-
-# ---------------------------------------------------------------------------
-# parse_perps_markets
-# ---------------------------------------------------------------------------
-
-
-class TestParsePerpsMarkets:
-    def test_list_of_dicts(self):
-        raw = {"markets": [
-            {"coin": "BTC", "fundingRate": 0.001, "openInterest": 50000},
-            {"coin": "ETH", "fundingRate": -0.0005, "openInterest": 30000},
-        ]}
-        result = parse_perps_markets(raw)
-        assert "BTC" in result
-        assert "ETH" in result
-        assert result["BTC"]["fundingRate"] == 0.001
-
-    def test_dict_values(self):
-        raw = {"markets": {"btc": {"coin": "BTC", "fundingRate": 0.001}}}
-        result = parse_perps_markets(raw)
-        assert "BTC" in result
-
-    def test_empty(self):
-        assert parse_perps_markets({}) == {}
-        assert parse_perps_markets({"markets": []}) == {}
+class TestParseHlPositions:
+    def test_returns_empty_list(self):
+        result = parse_hl_positions([])
+        assert result == []
 
 
 # ---------------------------------------------------------------------------

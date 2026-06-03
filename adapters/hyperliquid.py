@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.hyperliquid.xyz"
 INFO_ENDPOINT = "/info"
 TIMEOUT_S = 30.0
+CACHE_TTL_SECONDS = 55 * 60  # 55 minutes
 
 
 class HyperliquidAdapter:
@@ -133,48 +135,123 @@ class HyperliquidAdapter:
         try:
             now_ms = int(time.time() * 1000)
             start_ms = now_ms - hours * 3600 * 1000
-            r = self._client.post(
-                f"{self.base_url}{INFO_ENDPOINT}",
-                json={
-                    "type": "candleSnapshot",
-                    "req": {
-                        "coin": coin,
-                        "interval": interval,
-                        "startTime": start_ms,
-                        "endTime": now_ms,
-                    },
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                return []
-            # Normalize to consistent types and sort ascending by t
-            candles: list[dict[str, Any]] = []
-            for c in data:
-                if not isinstance(c, dict):
-                    continue
-                try:
-                    candles.append({
-                        "t": int(c.get("t", 0)),
-                        "o": float(c.get("o", 0)),
-                        "h": float(c.get("h", 0)),
-                        "l": float(c.get("l", 0)),
-                        "c": float(c.get("c", 0)),
-                        "v": float(c.get("v", 0)),
-                        # Keep extra fields for downstream use
-                        "T": int(c.get("T", 0)),
-                        "s": str(c.get("s", "")),
-                        "i": str(c.get("i", "")),
-                        "n": int(c.get("n", 0)),
-                    })
-                except (TypeError, ValueError):
-                    continue
-            candles.sort(key=lambda x: x["t"])
-            return candles
+            return self._fetch_candles_raw(coin, interval, start_ms, now_ms)
         except Exception as e:
             logger.warning("Hyperliquid fetch_candles failed: %s", e)
             return []
+
+    def _fetch_candles_raw(
+        self, coin: str, interval: str, start_ms: int, end_ms: int
+    ) -> list[dict[str, Any]]:
+        """Low-level candle fetch — makes the HTTP call and parses response.
+
+        Returns raw candle dicts sorted ascending by t.
+        Raises on HTTP errors (caller handles exceptions).
+        """
+        r = self._client.post(
+            f"{self.base_url}{INFO_ENDPOINT}",
+            json={
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": coin,
+                    "interval": interval,
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                },
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+        candles: list[dict[str, Any]] = []
+        for c in data:
+            if not isinstance(c, dict):
+                continue
+            try:
+                candles.append({
+                    "t": int(c.get("t", 0)),
+                    "o": float(c.get("o", 0)),
+                    "h": float(c.get("h", 0)),
+                    "l": float(c.get("l", 0)),
+                    "c": float(c.get("c", 0)),
+                    "v": float(c.get("v", 0)),
+                    "T": int(c.get("T", 0)),
+                    "s": str(c.get("s", "")),
+                    "i": str(c.get("i", "")),
+                    "n": int(c.get("n", 0)),
+                })
+            except (TypeError, ValueError):
+                continue
+        candles.sort(key=lambda x: x["t"])
+        return candles
+
+    def fetch_candles_cached(
+        self,
+        coin: str = "SOL",
+        interval: str = "1h",
+        hours: int = 168,
+        account_id: str = "deterministic",
+        project_root: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch candles with disk cache and 55-minute TTL.
+
+        Cache file: accounts/<account_id>/data/candles_<COIN>_<interval>.json
+        If cache file is < 55 minutes old, reads from disk (no HTTP call).
+        If stale or missing, fetches via API and writes to cache.
+
+        Returns raw candle dicts sorted ascending by t.
+        """
+        if project_root is None:
+            project_root = Path.cwd()
+
+        cache_dir = project_root / "accounts" / account_id / "data"
+        cache_path = cache_dir / f"candles_{coin}_{interval}.json"
+
+        # Check cache freshness
+        if cache_path.exists():
+            try:
+                mtime = cache_path.stat().st_mtime
+                age_seconds = time.time() - mtime
+                if age_seconds < CACHE_TTL_SECONDS:
+                    cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                    if isinstance(cached, list) and len(cached) > 0:
+                        logger.info(
+                            "Candle cache hit: %s (%d candles, age=%.0fs)",
+                            cache_path.name, len(cached), age_seconds,
+                        )
+                        return cached
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("Candle cache read failed: %s", e)
+
+        # Cache miss or stale — fetch fresh
+        try:
+            now_ms = int(time.time() * 1000)
+            start_ms = now_ms - hours * 3600 * 1000
+            candles = self._fetch_candles_raw(coin, interval, start_ms, now_ms)
+        except Exception as e:
+            logger.warning("Hyperliquid fetch_candles_cached failed: %s", e)
+            # Try to return stale cache as fallback
+            if cache_path.exists():
+                try:
+                    return json.loads(cache_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    pass
+            return []
+
+        # Write cache
+        if candles:
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(
+                    json.dumps(candles, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                logger.info("Candle cache written: %s (%d candles)", cache_path.name, len(candles))
+            except OSError as e:
+                logger.warning("Candle cache write failed: %s", e)
+
+        return candles
 
     # ------------------------------------------------------------------
     # Normalization
@@ -362,3 +439,44 @@ class HyperliquidAdapter:
         ))
 
         return points
+
+
+# ---------------------------------------------------------------------------
+# Candle helpers (module-level)
+# ---------------------------------------------------------------------------
+
+
+def candles_to_arrays(candles: list[dict[str, Any]]) -> tuple[list[float], list[float]]:
+    """Extract close prices and volumes from candle dicts.
+
+    Returns (closes, volumes) as parallel lists, most-recent last.
+    """
+    closes = [c["c"] for c in candles if isinstance(c.get("c"), (int, float))]
+    volumes = [c["v"] for c in candles if isinstance(c.get("v"), (int, float))]
+    return closes, volumes
+
+
+def candles_to_engine_candles(candles: list[dict[str, Any]]) -> list[Any]:
+    """Convert raw candle dicts to engine.volatility.Candle objects.
+
+    Returns a list of Candle objects suitable for ATR/volatility computation.
+    Invalid candles (where high < close) are skipped.
+    """
+    from engine.volatility import Candle
+
+    result: list[Candle] = []
+    for c in candles:
+        try:
+            o = float(c.get("o", 0))
+            h = float(c.get("h", 0))
+            l = float(c.get("l", 0))
+            cl = float(c.get("c", 0))
+            ts = str(c.get("t", ""))
+            if ts and not ts.endswith("Z") and not "+" in ts:
+                # Convert ms timestamp to ISO string
+                ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts) / 1000))
+            candle = Candle(open=o, high=h, low=l, close=cl, timestamp=ts)
+            result.append(candle)
+        except (ValueError, TypeError):
+            continue
+    return result

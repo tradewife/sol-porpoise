@@ -637,7 +637,99 @@ def _run_live_paper(account_id: str = "deterministic") -> int:
 
     all_datapoints.extend(whale_datapoints)
     all_datapoints.extend(catalyst_datapoints)
+
+    # --- Fetch Hyperliquid data (markets, orderbook, candles) ---
     hl_datapoints: list[Any] = []
+    try:
+        hl_market_points = hl_adapter.fetch_markets()
+        hl_datapoints.extend(hl_market_points)
+        all_datapoints.extend(hl_market_points)
+        print(f"[{run_id}]   HL markets: {len(hl_market_points)} datapoints")
+    except Exception as e:
+        print(f"[{run_id}]   WARNING: HL markets failed: {e}")
+
+    try:
+        hl_orderbook_points = hl_adapter.fetch_orderbook("SOL")
+        hl_datapoints.extend(hl_orderbook_points)
+        all_datapoints.extend(hl_orderbook_points)
+        print(f"[{run_id}]   HL orderbook: {len(hl_orderbook_points)} datapoints")
+    except Exception as e:
+        print(f"[{run_id}]   WARNING: HL orderbook failed: {e}")
+
+    # Fetch SOL candles (1h + 4h) with cache for hawk breakout and signals
+    sol_candles_1h: list[dict[str, Any]] = []
+    sol_candles_4h: list[dict[str, Any]] = []
+    sol_candle_engine: list[Any] = []
+    try:
+        sol_candles_1h = hl_adapter.fetch_candles_cached(
+            coin="SOL", interval="1h", hours=168,
+            account_id=account_id, project_root=PROJECT_ROOT,
+        )
+        sol_candles_4h = hl_adapter.fetch_candles_cached(
+            coin="SOL", interval="4h", hours=168,
+            account_id=account_id, project_root=PROJECT_ROOT,
+        )
+        if sol_candles_1h:
+            sol_candle_engine = hl_mod.candles_to_engine_candles(sol_candles_1h)
+            # Override flat mark-price candles for SOL with real OHLC
+            candles_by_symbol["SOL"] = sol_candle_engine
+            # Compute real ATR from candle data
+            if len(sol_candle_engine) >= 14:
+                try:
+                    atr_by_symbol["SOL"] = vol_mod.compute_atr(sol_candle_engine)
+                except ValueError:
+                    pass
+        print(f"[{run_id}]   HL candles: {len(sol_candles_1h)} 1h, {len(sol_candles_4h)} 4h")
+    except Exception as e:
+        print(f"[{run_id}]   WARNING: HL candle fetch failed: {e}")
+
+    # --- Hawk Breakout Signal (deterministic path) ---
+    hawk_signals_det: list[Any] = []
+    try:
+        from engine.hawk_breakout import compute_hawk_breakout_signal
+        from engine.mcp_data import extract_sm_tilt
+
+        for sym in universe[:8]:
+            closes_1h: list[float] = []
+            closes_4h: list[float] = []
+            volume_1h: list[float] = []
+
+            if sym == "SOL" and sol_candles_1h:
+                closes_1h, volume_1h = hl_mod.candles_to_arrays(sol_candles_1h)
+                if sol_candles_4h:
+                    closes_4h, _ = hl_mod.candles_to_arrays(sol_candles_4h)
+            else:
+                # Fallback: use mark-price closes from datapoints
+                closes_1h = [dp.value for dp in all_datapoints
+                             if getattr(dp, "symbol", None) == sym
+                             and "mark_price" in str(getattr(dp, "metric", ""))]
+                closes_4h = closes_1h
+                volume_1h = [dp.value for dp in all_datapoints
+                             if getattr(dp, "symbol", None) == sym
+                             and getattr(dp, "metric", "") == "volume_24h"]
+
+            if not closes_1h:
+                continue
+
+            sm_pct = extract_sm_tilt(
+                symbol=sym,
+                whale_points=whale_datapoints,
+                hl_market=None,
+            )
+
+            sig = compute_hawk_breakout_signal(
+                market=sym,
+                closes_1h=closes_1h,
+                closes_4h=closes_4h if closes_4h else closes_1h,
+                volume_1h=volume_1h if volume_1h else [0.0],
+                sm_long_pct=sm_pct,
+                structure_classification="structure_partial",
+            )
+            hawk_signals_det.append(sig)
+            if sig.signal != "none":
+                print(f"[{run_id}]   Hawk {sym}: {sig.signal} score={sig.score}")
+    except Exception as e:
+        print(f"[{run_id}]   WARNING: Hawk breakout (det) failed: {e}")
 
     candidates: list[dict[str, Any]] = []
     all_playbooks: list[dict[str, Any]] = []
@@ -1306,7 +1398,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     report.set_section("L", _format_signal_learning_section(signal_stats))
 
     # --- Gather Market Data ---
-    # Try MCP tools first, fall back to Imperial API
+    # HyperliquidAdapter for market data (replaces Phantom MCP), Flash Trade MCP for trading overview
     rich_data = mcp_mod.RichMarketData()
     all_datapoints: list[Any] = []
 
@@ -1318,37 +1410,28 @@ def _run_ai_paper(account_id: str = "ai") -> int:
             rich_data.raw_prices[m.symbol] = m.price
         print(f"[{run_id}] MCP trading overview: {len(rich_data.markets)} markets")
 
-    # Phase 2: Try MCP for perps account and positions
-    mcp_account_raw = state.get("_mcp_perps_account")
-    if mcp_account_raw and isinstance(mcp_account_raw, dict):
-        rich_data.account = mcp_mod.parse_account_summary(mcp_account_raw)
-        print(f"[{run_id}] MCP perps account: ${rich_data.account.available_usd:.2f} available")
+    # Phase 2: HyperliquidAdapter for markets (funding, OI, basis, leverage)
+    import adapters.hyperliquid as _hl_mod
+    _hl_adapter = _hl_mod.HyperliquidAdapter()
+    try:
+        hl_points = _hl_adapter.fetch_markets()
+        all_datapoints.extend(hl_points)
+        hl_prices, hl_funding, hl_oi, hl_vol = mcp_mod.parse_hl_datapoints(hl_points)
+        for sym, price in hl_prices.items():
+            rich_data.raw_prices.setdefault(sym, price)
+        rich_data.funding_rates.update(hl_funding)
+        rich_data.open_interest.update(hl_oi)
+        print(f"[{run_id}] HL adapter markets: {len(hl_points)} datapoints")
+    except Exception as e:
+        print(f"[{run_id}] WARNING: HL adapter markets failed: {e}")
 
-    mcp_positions_raw = state.get("_mcp_perps_positions")
-    if mcp_positions_raw and isinstance(mcp_positions_raw, (dict, list)):
-        existing_positions = mcp_mod.parse_perps_positions(mcp_positions_raw)
-        if rich_data.account:
-            rich_data.account.positions = existing_positions
-        print(f"[{run_id}] MCP existing positions: {len(existing_positions)}")
-
-    # Phase 3: Try MCP for HL market data (funding, OI, volume)
-    mcp_markets_raw = state.get("_mcp_perps_markets")
-    if mcp_markets_raw and isinstance(mcp_markets_raw, dict):
-        hl_markets = mcp_mod.parse_perps_markets(mcp_markets_raw)
-        for sym, mkt in hl_markets.items():
-            if "fundingRate" in mkt or "funding" in mkt:
-                fr = mkt.get("fundingRate", mkt.get("funding", 0))
-                if fr is not None:
-                    rich_data.funding_rates[sym] = float(fr)
-            if "openInterest" in mkt or "oi" in mkt:
-                oi = mkt.get("openInterest", mkt.get("oi", 0))
-                if oi is not None:
-                    rich_data.open_interest[sym] = float(oi)
-            if "volume24h" in mkt or "volume" in mkt:
-                vol = mkt.get("volume24h", mkt.get("volume", 0))
-                if vol is not None:
-                    rich_data.volume_24h[sym] = float(vol)
-        print(f"[{run_id}] MCP HL markets: {len(hl_markets)} symbols with data")
+    # Phase 3: HyperliquidAdapter for orderbook (book imbalance)
+    try:
+        hl_ob_points = _hl_adapter.fetch_orderbook("SOL")
+        all_datapoints.extend(hl_ob_points)
+        print(f"[{run_id}] HL adapter orderbook: {len(hl_ob_points)} datapoints")
+    except Exception as e:
+        print(f"[{run_id}] WARNING: HL adapter orderbook failed: {e}")
 
     # Phase 4: Flash Trade MCP prices (supplement)
     mcp_prices_raw = state.get("_mcp_prices")
@@ -1365,6 +1448,35 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     if mcp_pool_raw and isinstance(mcp_pool_raw, (dict, list)):
         pool_items = mcp_pool_raw if isinstance(mcp_pool_raw, list) else [mcp_pool_raw]
         rich_data.pool_data = pool_items
+
+    # Phase 6: Account data from MCP (if available)
+    mcp_account_raw = state.get("_mcp_perps_account")
+    if mcp_account_raw and isinstance(mcp_account_raw, dict):
+        account_state = mcp_mod.parse_hl_account(
+            mcp_mod.overview_to_datapoints(
+                mcp_mod.RichMarketData(
+                    account=mcp_mod.AccountState(
+                        total_value_usd=float(mcp_account_raw.get("totalValueUsd", 0) or 0),
+                        available_usd=float(mcp_account_raw.get("availableUsd", 0) or 0),
+                        withdrawable_usd=float(mcp_account_raw.get("withdrawableUsd", 0) or 0),
+                    ),
+                ),
+            ),
+        )
+        rich_data.account = account_state
+        print(f"[{run_id}] Account: ${account_state.available_usd:.2f} available")
+
+    mcp_positions_raw = state.get("_mcp_perps_positions")
+    if mcp_positions_raw and isinstance(mcp_positions_raw, (dict, list)):
+        if isinstance(mcp_positions_raw, list):
+            existing_positions = mcp_positions_raw
+        elif isinstance(mcp_positions_raw, dict):
+            existing_positions = mcp_positions_raw.get("positions", mcp_positions_raw.get("data", []))
+        else:
+            existing_positions = []
+        if rich_data.account:
+            rich_data.account.positions = existing_positions
+        print(f"[{run_id}] Existing positions: {len(existing_positions)}")
 
     # Convert MCP data to DataPoints for reports/ledgers
     all_datapoints.extend(mcp_mod.overview_to_datapoints(rich_data))
@@ -1455,6 +1567,7 @@ def _run_ai_paper(account_id: str = "ai") -> int:
     try:
         from engine.hawk_breakout import compute_hawk_breakout_signal
         from engine.mcp_data import extract_sm_tilt
+        import adapters.hyperliquid as _hl_mod
 
         # Collect whale data from Dextrabot for SM tilt
         _ai_whale_points: list[Any] = []
@@ -1467,25 +1580,63 @@ def _run_ai_paper(account_id: str = "ai") -> int:
         except Exception as e:
             print(f"[{run_id}] Hawk: Dextrabot unavailable for SM tilt: {e}")
 
-        # Build HL markets lookup by symbol (from MCP data already parsed)
+        # Fetch candles via HyperliquidAdapter with cache
+        _hl_adapter = _hl_mod.HyperliquidAdapter()
+        _ai_candles_1h: list[dict[str, Any]] = []
+        _ai_candles_4h: list[dict[str, Any]] = []
+        try:
+            _ai_candles_1h = _hl_adapter.fetch_candles_cached(
+                coin="SOL", interval="1h", hours=168,
+                account_id=account_id, project_root=PROJECT_ROOT,
+            )
+            _ai_candles_4h = _hl_adapter.fetch_candles_cached(
+                coin="SOL", interval="4h", hours=168,
+                account_id=account_id, project_root=PROJECT_ROOT,
+            )
+            print(f"[{run_id}] Hawk: {len(_ai_candles_1h)} 1h candles, {len(_ai_candles_4h)} 4h candles")
+        except Exception as e:
+            print(f"[{run_id}] Hawk: Candle fetch failed: {e}")
+
+        # Build HL markets lookup by symbol (from MCP data if available)
         _hl_markets_by_symbol: dict[str, dict[str, Any]] = {}
         mcp_mkts_raw = state.get("_mcp_perps_markets")
         if mcp_mkts_raw and isinstance(mcp_mkts_raw, dict):
-            _hl_markets_by_symbol = mcp_mod.parse_perps_markets(mcp_mkts_raw)
+            # Parse MCP markets dict manually (no longer using old perps parser)
+            items = mcp_mkts_raw.get("markets", mcp_mkts_raw.get("data", []))
+            if isinstance(items, dict):
+                items = list(items.values())
+            for item in items:
+                if isinstance(item, dict):
+                    sym_key = str(item.get("coin", item.get("symbol", ""))).upper()
+                    if sym_key:
+                        _hl_markets_by_symbol[sym_key] = item
 
         # Compute hawk signal for each symbol in universe
         for sym in universe[:8]:
-            closes = [dp.value for dp in all_datapoints
-                      if getattr(dp, "symbol", None) == sym
-                      and "mark_price" in str(getattr(dp, "metric", ""))]
-            vols = [dp.value for dp in all_datapoints
-                    if getattr(dp, "symbol", None) == sym
-                    and getattr(dp, "metric", "") == "volume_24h"]
-            if not closes:
+            closes_1h: list[float] = []
+            closes_4h: list[float] = []
+            volume_1h: list[float] = []
+
+            # Use real candle data for SOL
+            if sym == "SOL" and _ai_candles_1h:
+                closes_1h, volume_1h = _hl_mod.candles_to_arrays(_ai_candles_1h)
+                if _ai_candles_4h:
+                    closes_4h, _ = _hl_mod.candles_to_arrays(_ai_candles_4h)
+            else:
+                # Fallback to mark-price datapoints
+                closes_1h = [dp.value for dp in all_datapoints
+                             if getattr(dp, "symbol", None) == sym
+                             and "mark_price" in str(getattr(dp, "metric", ""))]
+                closes_4h = closes_1h
+                volume_1h = [dp.value for dp in all_datapoints
+                             if getattr(dp, "symbol", None) == sym
+                             and getattr(dp, "metric", "") == "volume_24h"]
+
+            if not closes_1h:
                 continue
             # Pad short series to at least 2 points
-            if len(closes) < 2:
-                closes = closes * 168
+            if len(closes_1h) < 2:
+                closes_1h = closes_1h * 168
 
             sm_pct = extract_sm_tilt(
                 symbol=sym,
@@ -1498,9 +1649,9 @@ def _run_ai_paper(account_id: str = "ai") -> int:
 
             sig = compute_hawk_breakout_signal(
                 market=sym,
-                closes_1h=closes,
-                closes_4h=closes,  # use same series; 4h alignment is slope-based
-                volume_1h=vols if vols else [0.0],
+                closes_1h=closes_1h,
+                closes_4h=closes_4h if closes_4h else closes_1h,
+                volume_1h=volume_1h if volume_1h else [0.0],
                 sm_long_pct=sm_pct,
                 structure_classification=structure_class,
             )

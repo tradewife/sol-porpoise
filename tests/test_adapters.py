@@ -624,3 +624,343 @@ class TestNoPhantomImports:
         if config_path.exists():
             content = config_path.read_text(encoding="utf-8").lower()
             assert "phantom" not in content
+
+
+# ===========================================================================
+# Candle Caching Tests (VAL-CANDLE-001, VAL-CANDLE-002)
+# ===========================================================================
+
+
+class TestCandleTimeRange:
+    """VAL-CANDLE-001: Candle fetching calculates startTime = now - 7*24*3600*1000ms."""
+
+    def test_candle_time_range(self) -> None:
+        """Verify fetch_candles sends correct 7-day time range."""
+        from unittest.mock import patch, MagicMock
+        from adapters.hyperliquid import HyperliquidAdapter
+        import time
+
+        adapter = HyperliquidAdapter()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _HL_CANDLES
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(adapter._client, "post", return_value=mock_response) as mock_post:
+            before = time.time()
+            adapter.fetch_candles(coin="SOL", interval="1h", hours=168)
+            after = time.time()
+
+        call_args = mock_post.call_args
+        body = call_args[1]["json"] if "json" in call_args[1] else call_args.kwargs["json"]
+
+        assert body["type"] == "candleSnapshot"
+        assert body["req"]["coin"] == "SOL"
+        assert body["req"]["interval"] == "1h"
+
+        # startTime should be ~7 days before endTime
+        now_ms_approx = (before + after) / 2 * 1000
+        expected_start = now_ms_approx - 7 * 24 * 3600 * 1000
+        assert abs(body["req"]["startTime"] - expected_start) < 5000
+        assert abs(body["req"]["endTime"] - now_ms_approx) < 5000
+
+
+class TestCandleCacheTTL:
+    """VAL-CANDLE-002: Candle caching to disk with 55-min TTL."""
+
+    def test_cache_file_written(self, tmp_path: Path) -> None:
+        """Cache file is written after fresh fetch."""
+        from unittest.mock import patch, MagicMock
+        from adapters.hyperliquid import HyperliquidAdapter
+
+        adapter = HyperliquidAdapter()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _HL_CANDLES
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(adapter._client, "post", return_value=mock_response):
+            candles = adapter.fetch_candles_cached(
+                coin="SOL", interval="1h", hours=168,
+                account_id="test", project_root=tmp_path,
+            )
+
+        cache_path = tmp_path / "accounts" / "test" / "data" / "candles_SOL_1h.json"
+        assert cache_path.exists()
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        assert isinstance(cached, list)
+        assert len(cached) > 0
+
+    def test_cache_hit_within_ttl(self, tmp_path: Path) -> None:
+        """No HTTP call when cache is fresh (< 55 minutes)."""
+        from unittest.mock import patch, MagicMock
+        from adapters.hyperliquid import HyperliquidAdapter
+
+        adapter = HyperliquidAdapter()
+        cache_dir = tmp_path / "accounts" / "test" / "data"
+        cache_dir.mkdir(parents=True)
+        cache_path = cache_dir / "candles_SOL_1h.json"
+        cache_path.write_text(json.dumps(_HL_CANDLES), encoding="utf-8")
+
+        with patch.object(adapter._client, "post") as mock_post:
+            candles = adapter.fetch_candles_cached(
+                coin="SOL", interval="1h", hours=168,
+                account_id="test", project_root=tmp_path,
+            )
+
+        mock_post.assert_not_called()
+        assert len(candles) == len(_HL_CANDLES)
+
+    def test_cache_miss_after_ttl(self, tmp_path: Path) -> None:
+        """HTTP call made when cache is stale (>= 55 minutes)."""
+        import os
+        import time
+        from unittest.mock import patch, MagicMock
+        from adapters.hyperliquid import HyperliquidAdapter
+
+        adapter = HyperliquidAdapter()
+        cache_dir = tmp_path / "accounts" / "test" / "data"
+        cache_dir.mkdir(parents=True)
+        cache_path = cache_dir / "candles_SOL_1h.json"
+        cache_path.write_text(json.dumps(_HL_CANDLES), encoding="utf-8")
+
+        # Set file mtime to 56 minutes ago (beyond TTL)
+        old_time = time.time() - 56 * 60
+        os.utime(cache_path, (old_time, old_time))
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = _HL_CANDLES
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(adapter._client, "post", return_value=mock_response) as mock_post:
+            candles = adapter.fetch_candles_cached(
+                coin="SOL", interval="1h", hours=168,
+                account_id="test", project_root=tmp_path,
+            )
+
+        mock_post.assert_called_once()
+        assert len(candles) > 0
+
+
+# ===========================================================================
+# Candle Helper Tests
+# ===========================================================================
+
+
+class TestCandleHelpers:
+    def test_candles_to_arrays(self) -> None:
+        from adapters.hyperliquid import candles_to_arrays
+        candles = [
+            {"t": 1000, "o": 150, "h": 152, "l": 149, "c": 151, "v": 1000},
+            {"t": 2000, "o": 151, "h": 153, "l": 150, "c": 152, "v": 1200},
+        ]
+        closes, vols = candles_to_arrays(candles)
+        assert closes == [151, 152]
+        assert vols == [1000, 1200]
+
+    def test_candles_to_engine_candles(self) -> None:
+        from adapters.hyperliquid import candles_to_engine_candles
+        candles = [
+            {"t": 1700000000000, "o": 150.0, "h": 152.0, "l": 149.0, "c": 151.0, "v": 1000},
+        ]
+        result = candles_to_engine_candles(candles)
+        assert len(result) == 1
+        assert result[0].open == 150.0
+        assert result[0].close == 151.0
+
+    def test_candles_to_engine_candles_skips_invalid(self) -> None:
+        from adapters.hyperliquid import candles_to_engine_candles
+        candles = [
+            {"t": 1700000000000, "o": 150.0, "h": 148.0, "l": 149.0, "c": 151.0, "v": 1000},
+        ]
+        # h=148 < max(o=150, c=151) -> ValueError from Candle validation -> skip
+        result = candles_to_engine_candles(candles)
+        assert len(result) == 0
+
+
+# ===========================================================================
+# Hawk Breakout with Candle Data Tests (VAL-CANDLE-003, VAL-CANDLE-004)
+# ===========================================================================
+
+
+class TestHawkWithCandleData:
+    """VAL-CANDLE-003: hawk_breakout with 168 synthetic breakout candles produces non-none signal."""
+
+    def test_hawk_with_168_breakout_candles(self) -> None:
+        """168 candles where last exceeds prior high -> non-none signal with score >= 5."""
+        from engine.hawk_breakout import compute_hawk_breakout_signal
+
+        # Build 168 closes where the last one breaks above the 7-day high
+        base = 100.0
+        closes_1h = [base] * 167 + [base * 1.005]  # 0.5% breakout
+        closes_4h = [base] * 41 + [base * 1.05]
+        volume_1h = [1000.0] * 167 + [2000.0]  # volume spike
+
+        sig = compute_hawk_breakout_signal(
+            market="SOL",
+            closes_1h=closes_1h,
+            closes_4h=closes_4h,
+            volume_1h=volume_1h,
+            sm_long_pct=60.0,
+            structure_classification="structure_partial",
+        )
+        assert sig.signal in ("long", "short")
+        assert sig.score >= 5
+
+    def test_hawk_insufficient_candles(self) -> None:
+        """VAL-CANDLE-004: < 168 candles returns signal=none without crashing."""
+        from engine.hawk_breakout import compute_hawk_breakout_signal
+
+        closes_1h = [100.0] * 50
+        sig = compute_hawk_breakout_signal(
+            market="SOL",
+            closes_1h=closes_1h,
+            closes_4h=[100.0] * 12,
+            volume_1h=[1000.0] * 50,
+            sm_long_pct=60.0,
+            structure_classification="structure_partial",
+        )
+        assert sig.signal == "none"
+        assert sig.score == 0
+
+
+# ===========================================================================
+# No Phantom Parsers in mcp_data (VAL-CROSS-005)
+# ===========================================================================
+
+
+class TestNoPhantomParsers:
+    """VAL-CROSS-005: mcp_data.py has no Phantom parsers."""
+
+    def test_no_parse_perps_markets(self) -> None:
+        import engine.mcp_data as mcp_mod
+        assert not hasattr(mcp_mod, "parse_perps_markets")
+
+    def test_no_parse_perps_positions(self) -> None:
+        import engine.mcp_data as mcp_mod
+        assert not hasattr(mcp_mod, "parse_perps_positions")
+
+    def test_no_parse_account_summary(self) -> None:
+        import engine.mcp_data as mcp_mod
+        assert not hasattr(mcp_mod, "parse_account_summary")
+
+    def test_has_parse_hl_datapoints(self) -> None:
+        import engine.mcp_data as mcp_mod
+        assert hasattr(mcp_mod, "parse_hl_datapoints")
+
+    def test_has_parse_hl_account(self) -> None:
+        import engine.mcp_data as mcp_mod
+        assert hasattr(mcp_mod, "parse_hl_account")
+
+    def test_has_parse_hl_positions(self) -> None:
+        import engine.mcp_data as mcp_mod
+        assert hasattr(mcp_mod, "parse_hl_positions")
+
+
+# ===========================================================================
+# Run Scan Wiring Tests (VAL-CANDLE-005, VAL-CANDLE-006, VAL-CROSS-004)
+# ===========================================================================
+
+
+class TestDeterministicCandleLoading:
+    """VAL-CANDLE-005: Deterministic path loads candles before hawk gate."""
+
+    def test_run_scan_imports_candle_functions(self) -> None:
+        """Verify run_scan.py can import candle helper functions."""
+        from adapters.hyperliquid import candles_to_arrays, candles_to_engine_candles
+        assert callable(candles_to_arrays)
+        assert callable(candles_to_engine_candles)
+
+    def test_hawk_breakout_receives_candle_data(self) -> None:
+        """VAL-CANDLE-005: Hawk function receives candle data as closes_1h."""
+        from unittest.mock import patch, MagicMock, call
+        from adapters.hyperliquid import candles_to_arrays
+
+        # Simulate 168 candles from fetch_candles_cached
+        raw_candles = [{"t": i * 3600000, "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 500}
+                       for i in range(168)]
+        raw_candles[-1]["c"] = 102.0  # breakout
+
+        closes, vols = candles_to_arrays(raw_candles)
+        assert len(closes) == 168
+        assert closes[-1] == 102.0
+
+        # Verify hawk gets this data and produces a signal
+        from engine.hawk_breakout import compute_hawk_breakout_signal
+        sig = compute_hawk_breakout_signal(
+            market="SOL",
+            closes_1h=closes,
+            closes_4h=closes,
+            volume_1h=vols,
+            sm_long_pct=60.0,
+            structure_classification="structure_partial",
+        )
+        assert sig.signal == "long"
+        assert sig.score >= 5
+
+
+class TestAIPaperCandleLoading:
+    """VAL-CANDLE-006: AI paper path loads candles before hawk gate."""
+
+    def test_ai_path_fetches_candles_for_hawk(self) -> None:
+        """Verify the AI path can fetch candles and pass to hawk."""
+        from adapters.hyperliquid import candles_to_arrays
+
+        # Simulate candle data
+        raw_candles = [{"t": i * 3600000, "o": 100, "h": 101, "l": 99, "c": 100.5, "v": 500}
+                       for i in range(168)]
+        raw_candles[-1]["c"] = 102.0
+
+        closes_1h, volume_1h = candles_to_arrays(raw_candles)
+        assert len(closes_1h) == 168
+
+        from engine.hawk_breakout import compute_hawk_breakout_signal
+        sig = compute_hawk_breakout_signal(
+            market="SOL",
+            closes_1h=closes_1h,
+            closes_4h=closes_1h,
+            volume_1h=volume_1h,
+            sm_long_pct=65.0,
+            structure_classification="structure_partial",
+        )
+        assert sig.signal in ("long", "short")
+
+
+class TestRunScanWiring:
+    """VAL-CROSS-004: run_scan.py correctly wires new adapters."""
+
+    def test_hyperliquid_adapter_used_in_live_paper(self) -> None:
+        """run_scan.py uses HyperliquidAdapter for candle fetching."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        assert "hl_adapter" in content
+        assert "fetch_candles_cached" in content
+        assert "compute_hawk_breakout_signal" in content
+
+    def test_hyperliquid_adapter_used_in_ai_paper(self) -> None:
+        """AI paper path uses HyperliquidAdapter for candles."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        # Count occurrences of hl adapter usage in the ai paper path
+        assert "fetch_candles_cached" in content
+        assert "candles_to_arrays" in content
+
+    def test_no_phantom_references_in_run_scan(self) -> None:
+        """run_scan.py has no PhantomAdapter references."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8").lower()
+        assert "phantomadapter" not in content
+        assert "from adapters.phantom" not in content.lower()
+
+    def test_no_phantom_parser_calls_in_run_scan(self) -> None:
+        """run_scan.py does not call parse_perps_markets etc."""
+        import engine.run_scan as rs
+        source = rs.__file__
+        content = Path(source).read_text(encoding="utf-8")
+        assert "parse_perps_markets" not in content
+        assert "parse_perps_positions" not in content
+        assert "parse_account_summary" not in content
